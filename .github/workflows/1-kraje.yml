@@ -1,0 +1,147 @@
+name: "1. Zbuduj kafle (cały świat lub wybrane kraje)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kraje:
+        description: "world = cały świat (najpierw Polska i sąsiedzi) albo kraje po przecinku, np. poland"
+        required: true
+        default: "world"
+      partia:
+        description: "Numer partii (zostaw 1 - kolejne uruchomią się same)"
+        required: true
+        default: "1"
+      runda:
+        description: "Runda (zostaw 1; runda 2 uzupełnia kafle, które się nie udały)"
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: budowa-kafli
+  cancel-in-progress: false
+
+jobs:
+  lista:
+    runs-on: ubuntu-latest
+    outputs:
+      bloki: ${{ steps.lista.outputs.bloki }}
+      partie: ${{ steps.lista.outputs.partie }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Biblioteki
+        run: pip install osmium shapely
+      - name: Lista bloków kafli
+        id: lista
+        working-directory: builder
+        env:
+          DRY_RUN: "1"
+          PIN_COUNTRIES: ${{ inputs.kraje }}
+          BATCH: ${{ inputs.partia }}
+        run: |
+          mkdir -p data grid_work_v2
+          python BuildWorldGrid_v2.py --list-tiles > lista.txt
+          cat lista.txt | grep "^PARTIE="
+          echo "partie=$(grep '^PARTIE=' lista.txt | sed 's/^PARTIE=\([0-9]*\).*/\1/')" >> "$GITHUB_OUTPUT"
+          echo "bloki=$(tail -n 1 lista.txt)" >> "$GITHUB_OUTPUT"
+
+  kafle:
+    needs: lista
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix: ${{ fromJSON(needs.lista.outputs.bloki) }}
+    steps:
+      - name: Więcej miejsca na dysku
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Programy
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q osmctools
+          pip install osmium shapely
+      - name: Model językowy (tłumaczenia z angielskiej Wikipedii)
+        if: vars.TLUMACZENIA_AI != '0'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama pull qwen2.5:3b
+      - name: GraphHopper z pamięci podręcznej
+        uses: actions/cache@v4
+        with:
+          path: builder/graphhopper-web-11.1.jar
+          key: graphhopper-web-11.1
+      - name: Konfiguracja
+        working-directory: builder
+        run: |
+          [ -f graphhopper-web-11.1.jar ] || wget -q -O graphhopper-web-11.1.jar https://repo1.maven.org/maven2/com/graphhopper/graphhopper-web/11.1/graphhopper-web-11.1.jar
+          mkdir -p srtm data grid_work_v2
+          sed "s#__VDIR__#$PWD#g" config.yml.template > config.yml
+      - name: Budowa kafli ${{ matrix.tiles }}
+        working-directory: builder
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_TARGET: github
+          WIKI_CONTACT: ${{ secrets.WIKI_CONTACT }}
+          TILE_LANG: pl
+          PIN_COUNTRIES: ${{ inputs.kraje }}
+          ONLY_TILES: ${{ matrix.tiles }}
+          WORKERS: "1"
+          JAVA_XMX: ${{ vars.TLUMACZENIA_AI == '0' && '11g' || '9g' }}
+          BUFFER_DEG: "0.4"
+          USE_O5M: "0"
+          DATA_MAX_GB: "40"
+          GH_TIMEOUT_S: "7200"
+          LLM_MAX_PER_TILE: ${{ vars.TLUMACZENIA_AI == '0' && '0' || '20' }}
+          STYLE_MAX_PER_TILE: "0"
+          MAX_RUNTIME_S: "18900"
+        run: |
+          python -u BuildWorldGrid_v2.py
+          if [ -s grid_work_v2/failed_tiles_v2.txt ]; then echo "Nieudane kafle (dorobi je runda 2):"; cat grid_work_v2/failed_tiles_v2.txt; exit 1; fi
+      - name: Zapis logu
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ inputs.partia }}-${{ strategy.job-index }}
+          path: builder/grid_work_v2/builder_v2.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  nastepna:
+    needs: [lista, kafle]
+    if: always() && needs.lista.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Uruchom następną partię
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARTIA: ${{ inputs.partia }}
+          PARTIE: ${{ needs.lista.outputs.partie }}
+          RUNDA: ${{ inputs.runda }}
+          KRAJE: ${{ inputs.kraje }}
+        run: |
+          if [ "$PARTIA" -lt "$PARTIE" ]; then
+            gh workflow run 1-kraje.yml --repo "$GITHUB_REPOSITORY" -f kraje="$KRAJE" -f partia=$((PARTIA + 1)) -f runda="$RUNDA"
+            echo "Uruchomiono partię $((PARTIA + 1)) z $PARTIE"
+          elif [ "$RUNDA" -lt 2 ]; then
+            gh workflow run 1-kraje.yml --repo "$GITHUB_REPOSITORY" -f kraje="$KRAJE" -f partia=1 -f runda=2
+            echo "Runda 2: uzupełnianie brakujących kafli (gotowe są pomijane)"
+          else
+            echo "KONIEC - wszystkie partie zbudowane"
+          fi
