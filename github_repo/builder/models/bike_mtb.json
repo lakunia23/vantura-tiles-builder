@@ -1,0 +1,66 @@
+{
+  "speed": [
+    {
+      "if": "true",
+      "limit_to": "15"
+    },
+    {
+      "if": "!bike_access && foot_access",
+      "multiply_by": "0.3"
+    },
+    {
+      "if": "surface == SAND",
+      "multiply_by": "0.5"
+    }
+  ],
+  "priority": [
+    {
+      "if": "road_class == MOTORWAY || road_class == TRUNK",
+      "multiply_by": "0"
+    },
+    {
+      "if": "road_class == STEPS",
+      "multiply_by": "0.15"
+    },
+    {
+      "if": "!bike_access && (road_class == PATH || road_class == TRACK || road_class == BRIDLEWAY)",
+      "multiply_by": "0"
+    },
+    {
+      "if": "!bike_access && foot_access",
+      "multiply_by": "0.08"
+    },
+    {
+      "if": "!bike_access && !foot_access",
+      "multiply_by": "0"
+    },
+    {
+      "if": "road_class == PATH || road_class == TRACK",
+      "multiply_by": "1.6"
+    },
+    {
+      "if": "(surface == GROUND || surface == DIRT || surface == COMPACTED || surface == FINE_GRAVEL || surface == GRAVEL)",
+      "multiply_by": "1.3"
+    },
+    {
+      "if": "surface == SAND",
+      "multiply_by": "0.5"
+    },
+    {
+      "if": "road_class == PRIMARY",
+      "multiply_by": "0.1"
+    },
+    {
+      "if": "road_class == SECONDARY",
+      "multiply_by": "0.3"
+    },
+    {
+      "if": "road_class == TERTIARY",
+      "multiply_by": "0.7"
+    },
+    {
+      "if": "road_class == FOOTWAY || road_class == PEDESTRIAN",
+      "multiply_by": "0.4"
+    }
+  ]
+}

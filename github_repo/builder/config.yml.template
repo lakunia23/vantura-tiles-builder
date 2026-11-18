@@ -1,0 +1,37 @@
+# GraphHopper 11.1 - konfiguracja budowy kafli Vantura (wygenerowana: tools/gen_build_config.py)
+# Modele custom = te same reguły co VanturaWeighting.kt na telefonie, dzięki czemu flagi <profil>_subnetwork
+# (usuwanie "wysp") są spójne z routingiem na urządzeniu.
+graphhopper:
+  datareader.file: ""
+  graph.location: ""
+  graph.dataaccess: MMAP_STORE
+  import.osm.ignored_highways: ""
+  graph.elevation.provider: srtm
+  graph.elevation.cache_dir: "__VDIR__/srtm"
+  graph.elevation.edge_smoothing: moving_average
+  graph.elevation.edge_smoothing.moving_average.window_size: 150
+  graph.elevation.long_edge_sampling_distance: 60
+  graph.encoded_values: road_class, road_environment, surface, smoothness, track_type, hike_rating, mtb_rating, bike_access, bike_average_speed, bike_priority, foot_access, foot_average_speed, foot_priority, roundabout, foot_network, bike_network, max_speed, average_slope, max_slope
+  prepare.min_network_size: 200
+  custom_models.directory: "__VDIR__/models"
+  profiles:
+    - name: bicycle
+      custom_model_files: [bicycle.json]
+    - name: bike_road
+      custom_model_files: [bike_road.json]
+    - name: bike_gravel
+      custom_model_files: [bike_gravel.json]
+    - name: bike_mtb
+      custom_model_files: [bike_mtb.json]
+    - name: pedestrian
+      custom_model_files: [pedestrian.json]
+    - name: foot_paved
+      custom_model_files: [foot_paved.json]
+    - name: foot_trail
+      custom_model_files: [foot_trail.json]
+    - name: foot_accessible
+      custom_model_files: [foot_accessible.json]
+    - name: skate
+      custom_model_files: [skate.json]
+  profiles_ch: []
+  profiles_lm: []

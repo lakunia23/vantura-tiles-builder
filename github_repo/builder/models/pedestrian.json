@@ -1,0 +1,34 @@
+{
+  "speed": [
+    {
+      "if": "true",
+      "limit_to": "5"
+    }
+  ],
+  "priority": [
+    {
+      "if": "road_class == MOTORWAY || road_class == TRUNK",
+      "multiply_by": "0"
+    },
+    {
+      "if": "!foot_access",
+      "multiply_by": "0"
+    },
+    {
+      "if": "road_class == PEDESTRIAN || road_class == FOOTWAY || road_class == PATH || road_class == LIVING_STREET",
+      "multiply_by": "1.4"
+    },
+    {
+      "if": "road_class == PRIMARY",
+      "multiply_by": "0.3"
+    },
+    {
+      "if": "road_class == SECONDARY",
+      "multiply_by": "0.6"
+    },
+    {
+      "if": "surface == SAND",
+      "multiply_by": "0.3"
+    }
+  ]
+}
