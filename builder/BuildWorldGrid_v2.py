@@ -504,8 +504,13 @@ def build_tile(lat, lon, sources, force):
         if poi_count == 0 and osm_size < 100 * 1024:
             log(f"  🌊 {tile_id}: morze/pustkowie (0 POI, {osm_size} B) - pomijam")
             return True
-        # Opisy: Wikipedia PL -> tłumaczenie EN (tylko fakty z tekstu) -> prawdziwe dane OSM. Bez zdjęć.
-        enrich_descriptions(scanner.pois, log, places=scanner.places)
+        # Opisy: Wikipedia PL -> obcojęzyczna Wikipedia (TranslateGemma + NLLB-200) -> bogate dane OSM/Wikidata.
+        enrich_descriptions(
+            scanner.pois, log,
+            places=scanner.places,
+            geo_wiki=scanner.geo_wiki,
+            protected_areas=scanner.protected_areas,
+        )
         conn = sqlite3.connect(poi_db)
         cur = conn.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS pois (
