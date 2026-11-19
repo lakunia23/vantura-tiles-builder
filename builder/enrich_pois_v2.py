@@ -198,11 +198,11 @@ def describe_from_osm(p):
         sent.append(f"Gatunek: {t['species']}")
     if t.get("inscription"):
         ins = re.sub(r"\s+", " ", t["inscription"]).strip()
-        if len(ins) <= 400:  # dłuższy napis pomijamy zamiast go urywać
+        if len(ins) <= 200:  # dłuższy napis pomijamy zamiast go urywać
             sent.append(f"Napis: „{ins}”")
     desc = t.get("description:pl") or p.get("_desc_translated") or t.get("description")
-    if desc and looks_english(desc) and not t.get("description:pl"):
-        desc = None  # angielski opis z OSM tylko po przetłumaczeniu (z kontrolą liczb)
+    if desc and not t.get("description:pl") and not p.get("_desc_translated") and not looks_polish(desc):
+        desc = None  # opis z mapy w innym języku tylko po przetłumaczeniu (z kontrolą liczb)
     if desc and len(desc) > 15:
         desc = full_sentences(desc, 600, 4) or (desc.strip() if len(desc) <= 300 else "")
         if desc:
@@ -212,7 +212,9 @@ def describe_from_osm(p):
     elif t.get("fee") == "yes":
         sent.append("Wstęp płatny")
     if t.get("opening_hours") and len(t["opening_hours"]) <= 60:
-        sent.append(f"Godziny otwarcia: {t['opening_hours']}")
+        oh = opening_hours_pl(t["opening_hours"])
+        if oh:
+            sent.append(f"Godziny otwarcia: {oh}")
     # całe zdania; gdy za długo - pomijamy ostatnie zdania, nigdy nie tniemy w środku
     parts = [x if x.endswith((".", "”", "!", "?")) else x + "." for x in sent if x]
     out = []
@@ -258,7 +260,7 @@ class Wiki:
         qids = [q for q in dict.fromkeys(qids) if re.fullmatch(r"Q\d+", q or "")]
         for i in range(0, len(qids), 50):
             data = self._get("https://www.wikidata.org/w/api.php", {
-                "action": "wbgetentities", "ids": "|".join(qids[i:i + 50]), "props": "sitelinks|descriptions|claims",
+                "action": "wbgetentities", "ids": "|".join(qids[i:i + 50]), "props": "sitelinks|descriptions|claims|labels",
                 "sitefilter": "|".join(f"{l}wiki" for l in ["pl", "en"] + OTHER_WIKI_LANGS), "languages": "pl"})
             for qid, ent in (data.get("entities") or {}).items():
                 sl = ent.get("sitelinks") or {}
@@ -270,6 +272,9 @@ class Wiki:
                 d = ((ent.get("descriptions") or {}).get("pl") or {}).get("value")
                 if d:
                     rec["desc_pl"] = d
+                lab = ((ent.get("labels") or {}).get("pl") or {}).get("value")
+                if lab:
+                    rec["label_pl"] = lab
                 rec["inception"] = _wikidata_date((ent.get("claims") or {}).get("P571"))
                 out[qid] = rec
             time.sleep(0.2)
@@ -345,6 +350,127 @@ def _wikidata_date(claims):
 
 
 ENGLISH_HINT = re.compile(r"\b(the|and|was|were|is|of|with|which|who|built|located|contains|visitors)\b", re.I)
+
+
+FOREIGN_CHARS = re.compile(r"[őűäüößřěčďťňľĺŕůáéíúýâêîôûàèìòùãõñçøåæ]", re.I)
+POLISH_WORDS = re.compile(r"\b(i|w|na|jest|się|oraz|przez|został|została|zostało|który|która|które|od|do|z|ze|nad|pod)\b", re.I)
+
+
+def looks_polish(text):
+    """Czy tekst jest po polsku (opis z mapy w innym języku nie trafia do opisu bez tłumaczenia)."""
+    if FOREIGN_CHARS.search(text):
+        return False
+    if re.search(r"[ąćęłńśźż]", text, re.I):
+        return True
+    return len(POLISH_WORDS.findall(text)) >= 2 and not looks_english(text)
+
+
+_OH_DAYS = {"Mo": "pon.", "Tu": "wt.", "We": "śr.", "Th": "czw.", "Fr": "pt.", "Sa": "sob.", "Su": "niedz.", "PH": "święta"}
+_OH_MONTHS = {"Jan": "sty", "Feb": "lut", "Mar": "mar", "Apr": "kwi", "May": "maj", "Jun": "cze", "Jul": "lip",
+              "Aug": "sie", "Sep": "wrz", "Oct": "paź", "Nov": "lis", "Dec": "gru"}
+
+
+def opening_hours_pl(v):
+    """Godziny otwarcia z zapisu OSM ("Nov-Mar Mo-Su 06:00-20:00") na polski; None gdy zapis nietypowy."""
+    v = v.strip()
+    if v == "24/7":
+        return "całą dobę"
+    if re.search(r"[a-z]{4,}|sunrise|sunset|\(|\|\|", v, re.I):
+        return None  # komentarze/wyrażenia - nie zgadujemy
+    out = re.sub(r"\b(Mo|Tu|We|Th|Fr|Sa|Su|PH)\b", lambda m: _OH_DAYS[m.group(1)], v)
+    out = re.sub(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", lambda m: _OH_MONTHS[m.group(1)], out)
+    out = re.sub(r"\boff\b|\bclosed\b", "nieczynne", out)
+    out = out.replace(";", ",").replace("-", "–")
+    if re.search(r"[A-Za-z]{2,}", re.sub(r"pon|wt|śr|czw|pt|sob|niedz|święta|nieczynne|sty|lut|mar|kwi|maj|cze|lip|sie|wrz|paź|lis|gru", "", out)):
+        return None
+    return out
+
+
+# słowo pospolite w nazwie (w różnych językach) -> (polskie słowo, rodzaje obiektu, przy których wolno tłumaczyć)
+_CAVE = {"cave_entrance"}
+_CASTLE = {"castle", "ruins", "fort"}
+_PALACE = {"palace", "manor", "castle"}
+_FALL = {"waterfall"}
+_SPRING = {"spring"}
+_TOWER = {"observation_tower", "viewpoint"}
+_VIEW = {"viewpoint"}
+_MUSEUM = {"museum", "art_museum"}
+_RUINS = {"ruins", "castle"}
+NAME_WORDS = {
+    # jaskinie
+    "cave": ("Jaskinia", _CAVE), "cavern": ("Jaskinia", _CAVE), "höhle": ("Jaskinia", _CAVE),
+    "barlang": ("Jaskinia", _CAVE), "zsomboly": ("Jaskinia", _CAVE), "jeskyně": ("Jaskinia", _CAVE),
+    "jaskyňa": ("Jaskinia", _CAVE), "grotte": ("Grota", _CAVE), "grotta": ("Grota", _CAVE), "cueva": ("Jaskinia", _CAVE),
+    "peștera": ("Jaskinia", _CAVE), "jama": ("Jaskinia", _CAVE), "špilja": ("Jaskinia", _CAVE), "pećina": ("Jaskinia", _CAVE),
+    # zamki, pałace, ruiny
+    "castle": ("Zamek", _CASTLE), "burg": ("Zamek", _CASTLE), "burgruine": ("Ruiny zamku", _RUINS),
+    "vár": ("Zamek", _CASTLE), "várrom": ("Ruiny zamku", _RUINS), "hrad": ("Zamek", _CASTLE),
+    "zřícenina": ("Ruiny", _RUINS), "zrúcanina": ("Ruiny", _RUINS), "château": ("Zamek", _PALACE),
+    "castillo": ("Zamek", _CASTLE), "castello": ("Zamek", _CASTLE), "schloss": ("Pałac", _PALACE),
+    "palace": ("Pałac", _PALACE), "palast": ("Pałac", _PALACE), "kastély": ("Pałac", _PALACE),
+    "zámek": ("Pałac", _PALACE), "zámok": ("Pałac", _PALACE), "kaštieľ": ("Dwór", _PALACE), "kúria": ("Dwór", _PALACE),
+    "manor": ("Dwór", _PALACE), "ruine": ("Ruiny", _RUINS), "ruins": ("Ruiny", _RUINS), "rom": ("Ruiny", _RUINS),
+    # woda
+    "waterfall": ("Wodospad", _FALL), "falls": ("Wodospad", _FALL), "wasserfall": ("Wodospad", _FALL),
+    "vízesés": ("Wodospad", _FALL), "vodopád": ("Wodospad", _FALL), "cascada": ("Wodospad", _FALL),
+    "cascata": ("Wodospad", _FALL), "cascade": ("Wodospad", _FALL),
+    "spring": ("Źródło", _SPRING), "quelle": ("Źródło", _SPRING), "forrás": ("Źródło", _SPRING),
+    "pramen": ("Źródło", _SPRING), "prameň": ("Źródło", _SPRING), "kút": ("Źródło", _SPRING),
+    # widoki
+    "kilátó": ("Wieża widokowa", _TOWER), "kilátótorony": ("Wieża widokowa", _TOWER),
+    "aussichtsturm": ("Wieża widokowa", _TOWER), "rozhledna": ("Wieża widokowa", _TOWER),
+    "rozhľadňa": ("Wieża widokowa", _TOWER), "lookout": ("Punkt widokowy", _VIEW),
+    "aussichtspunkt": ("Punkt widokowy", _VIEW), "viewpoint": ("Punkt widokowy", _VIEW),
+    # muzea
+    "museum": ("Muzeum", _MUSEUM), "múzeum": ("Muzeum", _MUSEUM), "muzeum": ("Muzeum", _MUSEUM),
+    "musée": ("Muzeum", _MUSEUM), "museo": ("Muzeum", _MUSEUM),
+}
+# słowa świadczące o złożonej nazwie ("Cave of the Winds", "Grotte de la ...") - wtedy nie tłumaczymy
+_NAME_GLUE = {"of", "the", "de", "la", "le", "les", "del", "della", "di", "da", "der", "die", "das", "des", "im", "am",
+              "an", "auf", "zu", "von", "und", "and", "és", "a", "az", "na", "pod", "nad", "u", "v", "ve", "y", "e"}
+
+
+# przymiotniki pospolite przy muzeach ("Mestské múzeum" -> "Muzeum Miejskie")
+MUSEUM_ADJ = {"mestské": "Miejskie", "městské": "Miejskie", "városi": "Miejskie", "city": "Miejskie", "town": "Miejskie",
+              "municipal": "Miejskie", "stadt": "Miejskie", "helytörténeti": "Regionalne", "regionálne": "Regionalne",
+              "regionální": "Regionalne", "vlastivedné": "Regionalne", "vlastivědné": "Regionalne", "regional": "Regionalne",
+              "local": "Regionalne", "megyei": "Okręgowe", "národné": "Narodowe", "národní": "Narodowe", "nemzeti": "Narodowe",
+              "national": "Narodowe", "zemské": "Krajowe", "landes": "Krajowe", "diecézne": "Diecezjalne", "egyházmegyei": "Diecezjalne"}
+
+
+def polish_name(name, sub, wd_label=None):
+    """Nazwa po polsku: etykieta z Wikidata albo przetłumaczone słowo pospolite + nazwa własna bez zmian.
+    "Mammoth Cave" -> "Jaskinia Mammoth", "Pipa-zsomboly" -> "Jaskinia Pipa", "Burg Forchtenstein" -> "Zamek Forchtenstein".
+    None = zostaw oryginał."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    if wd_label and wd_label.strip() and wd_label.strip().lower() != name.lower() and not wd_label.strip().startswith("Q"):
+        return wd_label.strip()
+    tokens = name.split()
+    # Węgierskie złożenia z łącznikiem: "Pipa-zsomboly", "Szemlő-hegyi-barlang"
+    if len(tokens) == 1 and "-" in name:
+        head, _, tail = name.rpartition("-")
+        w = NAME_WORDS.get(tail.lower())
+        if w and sub in w[1] and head:
+            return f"{w[0]} {head}"
+        return None
+    for pos in (0, len(tokens) - 1):
+        w = NAME_WORDS.get(tokens[pos].lower().strip(",."))
+        if not w or sub not in w[1] or len(tokens) < 2:
+            continue
+        rest = tokens[1:] if pos == 0 else tokens[:-1]
+        if any(t.lower() in _NAME_GLUE for t in rest):
+            return None
+        if w[0] == "Muzeum" and len(rest) == 1 and rest[0].lower() in MUSEUM_ADJ:
+            return f"Muzeum {MUSEUM_ADJ[rest[0].lower()]}"
+        # w pozostałej części nieprzetłumaczone słowa pospolite (małą literą) -> zostaw oryginał
+        if any(t[:1].isalpha() and t[:1].islower() for t in rest):
+            return None
+        if not any(ch.isupper() for ch in "".join(rest)):  # brak nazwy własnej ("cave entrance")
+            return None
+        return f"{w[0]} {' '.join(rest)}"
+    return None
 
 
 def looks_english(text):
@@ -434,21 +560,38 @@ def numbers_ok(source, translated):
     return True
 
 
-def translate_en_pl(text, name, url, model, lang="en"):
-    prompt = (f"Przetłumacz poniższy tekst z {LANG_NAMES_PL.get(lang, 'obcojęzycznej')} Wikipedii na naturalny, poprawny język polski (od 3 do 10 pełnych zdań, zachowaj wszystkie ważne informacje). "
+TR_STATS = {}
+
+
+def _tr_stat(key):
+    TR_STATS[key] = TR_STATS.get(key, 0) + 1
+
+
+def translate_en_pl(text, name, url, model, lang="en", source="wiki"):
+    text = full_sentences(text, 1600, 8) or text[:1600]
+    where = f"z {LANG_NAMES_PL.get(lang, 'obcojęzycznej')} Wikipedii" if source == "wiki" else "(opis obiektu z mapy, w języku obcym)"
+    prompt = (f"Przetłumacz poniższy tekst {where} na naturalny, poprawny język polski (od 3 do 10 pełnych zdań, zachowaj wszystkie ważne informacje). "
               "Używaj WYŁĄCZNIE informacji z tekstu. Nie dodawaj żadnych faktów, dat, liczb ani ocen. "
               f"Obiekt: {name}.\nTEKST:\n{text}\nTŁUMACZENIE:")
-    body = json.dumps({"model": model, "prompt": prompt, "stream": False, "keep_alive": "1m", "options": {"temperature": 0.1}}).encode()
+    body = json.dumps({"model": model, "prompt": prompt, "stream": False, "keep_alive": "10m",
+                       "options": {"temperature": 0.1, "num_predict": 700, "num_ctx": 4096}}).encode()
     try:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=120) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             out = json.loads(r.read().decode("utf-8")).get("response", "").strip()
-    except Exception:
+    except Exception as e:
+        _tr_stat(f"błąd modelu ({type(e).__name__})")
         return None
     out = re.sub(r"\s+", " ", out).strip().strip('"')
-    if len(out) < 20 or not numbers_ok(text, out):
+    if len(out) < 20:
+        _tr_stat("pusta odpowiedź")
         return None
-    return full_sentences(out) or None
+    if not numbers_ok(text, out):
+        _tr_stat("odrzucone - liczby spoza oryginału")
+        return None
+    res = full_sentences(out) or None
+    _tr_stat("udane" if res else "bez pełnych zdań")
+    return res
 
 
 def proper_nouns_ok(source, text):
@@ -558,35 +701,47 @@ def enrich_descriptions(pois, log=print, places=None):
     has_pl = {i for i, t in pl_title.items() if pl_txt.get(t)}
     en_queue = sorted([i for i in en_title if i not in has_pl and en_txt.get(en_title[i])], key=rank)
     osm_en_queue = sorted([i for i, p in enumerate(pois) if i not in has_pl and i not in en_title
-                           and (p.get("tags") or {}).get("description") and looks_english(p["tags"]["description"])], key=rank)
+                           and (p.get("tags") or {}).get("description") and not (p.get("tags") or {}).get("description:pl")
+                           and len(p["tags"]["description"]) > 25 and not looks_polish(p["tags"]["description"])], key=rank)
     other_queue = sorted([i for i, o in other_title.items() if other_txt.get(o)], key=rank)
     llm_on = llm_max > 0 and bool(en_queue or osm_en_queue or other_queue) and ollama_available(llm_url)
     translated = {}
+    TR_STATS.clear()
     if llm_on:
-        budget = llm_max
-        for i in en_queue:
-            if budget <= 0:
+        # jedna kolejka: najpierw najcenniejsze atrakcje (zamki, muzea...), niezależnie od języka
+        jobs = [(rank(i), "en", i) for i in en_queue] + [(rank(i), "other", i) for i in other_queue]
+        jobs.sort(key=lambda j: j[0])
+        jobs += [(None, "osm", i) for i in osm_en_queue]
+        tried = 0
+        llm_seconds = float(os.environ.get("LLM_SECONDS_PER_TILE", "900"))
+        t_llm = time.time()
+        for _, kind, i in jobs[:llm_max]:
+            if time.time() - t_llm > llm_seconds:
+                log(f"  [Tłumaczenia] limit czasu {llm_seconds:.0f} s na kafel - reszta z danych mapy")
                 break
-            budget -= 1
-            tr = translate_en_pl(full_sentences(en_txt[en_title[i]], 2500, 12), pois[i].get("name"), llm_url, llm_model)
-            if tr:
-                translated[i] = tr
-        for i in other_queue:
-            if budget <= 0:
+            if tried >= 3 and TR_STATS.get("udane", 0) == 0 and \
+                    sum(v for k, v in TR_STATS.items() if k.startswith("błąd")) == tried:
+                log("  ⚠️ Model językowy nie odpowiada - tłumaczenia w tym kaflu pominięte")
                 break
-            budget -= 1
-            lang, title = other_title[i]
-            tr = translate_en_pl(full_sentences(other_txt[(lang, title)], 2500, 12), pois[i].get("name"), llm_url, llm_model, lang)
-            if tr:
-                translated[i] = tr
-                pois[i]["_tr_lang"] = lang
-        for i in osm_en_queue:
-            if budget <= 0:
-                break
-            budget -= 1
-            tr = translate_en_pl(full_sentences(pois[i]["tags"]["description"], 2500, 12) or pois[i]["tags"]["description"][:2500], pois[i].get("name"), llm_url, llm_model)
-            if tr:
-                pois[i]["_desc_translated"] = tr
+            tried += 1
+            if kind == "en":
+                tr = translate_en_pl(en_txt[en_title[i]], pois[i].get("name"), llm_url, llm_model)
+                if tr:
+                    translated[i] = tr
+            elif kind == "other":
+                lang, title = other_title[i]
+                tr = translate_en_pl(other_txt[(lang, title)], pois[i].get("name"), llm_url, llm_model, lang)
+                if tr:
+                    translated[i] = tr
+                    pois[i]["_tr_lang"] = lang
+            else:
+                tr = translate_en_pl(pois[i]["tags"]["description"], pois[i].get("name"), llm_url, llm_model, None, "osm")
+                if tr:
+                    pois[i]["_desc_translated"] = tr
+        log(f"  [Tłumaczenia] kandydatów: {len(en_queue)} EN + {len(other_queue)} inne języki + {len(osm_en_queue)} opisy z mapy"
+            f" | wynik: {TR_STATS or 'brak prób'} | {time.time() - t_llm:.0f} s")
+    elif llm_max > 0 and (en_queue or other_queue or osm_en_queue):
+        log(f"  ⚠️ Model językowy niedostępny ({llm_url}) - {len(en_queue) + len(other_queue)} artykułów bez tłumaczenia")
     # "Czytaj więcej": gdy wstęp ma < 5 zdań, dobieramy dalszą część artykułu (najcenniejsze atrakcje najpierw)
     long_max = int(os.environ.get("WIKI_LONG_MAX_PER_TILE", "200"))
     if contact and long_max > 0:
@@ -621,6 +776,35 @@ def enrich_descriptions(pois, log=print, places=None):
             styled = stylize_pl(pois[i]["description"], pois[i].get("name"), llm_url, llm_model)
             if styled:
                 pois[i]["description"], pois[i]["desc_source"] = styled, "osm_styl"
+    # polskie nazwy (oryginał zostaje w name_local - taki napis turysta zobaczy na miejscu)
+    renamed = 0
+    for p in pois:
+        pl = polish_name(p.get("name"), p.get("sub_cat"), (p.get("_wd") or {}).get("label_pl"))
+        if pl and pl != p.get("name"):
+            p["name_local"] = p["name"]
+            p["name"] = pl
+            renamed += 1
+    if renamed:
+        log(f"  [Nazwy] po polsku: {renamed} (oryginalne nazwy zachowane)")
+    # nazwy z samych cyfr ("1956") -> "Miejsce pamięci 1956"
+    for p in pois:
+        if re.fullmatch(r"[\d\s.,/–-]+", p.get("name") or ""):
+            kind = TYPE_PL.get(p.get("sub_cat") or "", "Atrakcja")
+            if p.get("sub_cat") == "memorial" and (p.get("tags") or {}).get("memorial") in MEMORIAL_PL:
+                kind = MEMORIAL_PL[p["tags"]["memorial"]]
+            p["name"] = f"{kind} {p['name'].strip()}"
+    # duplikaty: ta sama nazwa i rodzaj w promieniu ok. 60 m -> zostaje lepiej opisany
+    best = {}
+    for idx, p in enumerate(pois):
+        key = ((p.get("name") or "").strip().lower(), p.get("sub_cat"), round(p["lat"] / 0.0006), round(p["lng"] / 0.0009))
+        score = (p["desc_source"] != "osm", bool(p.get("wikidata")), len(p.get("description") or ""))
+        if key not in best or score > best[key][0]:
+            best[key] = (score, idx)
+    keep = {idx for _, idx in best.values()}
+    removed = len(pois) - len(keep)
+    pois[:] = [p for idx, p in enumerate(pois) if idx in keep]
+    if removed:
+        log(f"  [Opisy] usunięto duplikaty: {removed}")
     for p in pois:
         key = p["desc_source"] if p["desc_source"] in stats else "wiki_en_pl"
         stats[key] += 1
