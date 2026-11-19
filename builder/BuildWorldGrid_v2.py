@@ -511,13 +511,13 @@ def build_tile(lat, lon, sources, force):
         cur.execute("""CREATE TABLE IF NOT EXISTS pois (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, lat REAL NOT NULL, lng REAL NOT NULL, category TEXT NOT NULL,
             sub_category TEXT, elevation REAL, wikidata_id TEXT, image_url TEXT, description TEXT,
-            lang TEXT DEFAULT 'pl', rating REAL DEFAULT 0.0)""")
+            lang TEXT DEFAULT 'pl', rating REAL DEFAULT 0.0, desc_source TEXT)""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pois_coords ON pois (lat, lng)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pois_cat ON pois (category)")
         for p in scanner.pois:
-            cur.execute("INSERT OR REPLACE INTO pois VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            cur.execute("INSERT OR REPLACE INTO pois VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (p["id"], p["name"], p["lat"], p["lng"], p["category"], p["sub_cat"], p["elevation"],
-                         p["wikidata"], None, p["description"], LANG, 0.0))
+                         p["wikidata"], None, p["description"], LANG, 0.0, p.get("desc_source")))
         conn.commit()
         cur.execute("VACUUM")
         conn.close()

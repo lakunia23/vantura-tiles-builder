@@ -4,7 +4,7 @@
 VANTURA - OPISY ATRAKCJI (etap budowy kafla, zastępuje dawną Maszynę 2)
 
 Zasada: opis ma być PRAWDZIWY i ciekawy. Trzy poziomy, od najlepszego:
-  1. Polska Wikipedia  - wstęp artykułu (2-3 zdania). Artykuł wskazany przez tag wikidata/wikipedia
+  1. Polska Wikipedia  - wstęp artykułu (pełne zdania, do 10 zdań - w aplikacji 2-3 + "Czytaj więcej"). Artykuł wskazany przez tag wikidata/wikipedia
                          z OpenStreetMap (bez zgadywania po nazwie - zero pomyłek "nie ten obiekt").
   2. Angielska Wikipedia - lokalny model (Ollama) TŁUMACZY i streszcza wyłącznie ten tekst.
                          Kontrola: jeśli w tłumaczeniu pojawi się liczba, której nie ma w oryginale,
@@ -197,26 +197,30 @@ def describe_from_osm(p):
     if t.get("species"):
         sent.append(f"Gatunek: {t['species']}")
     if t.get("inscription"):
-        ins = t["inscription"].strip()
-        if len(ins) > 160:
-            ins = ins[:157].rsplit(" ", 1)[0].rstrip(",;:- ") + "..."
-        sent.append(f"Napis: „{ins}”")
+        ins = re.sub(r"\s+", " ", t["inscription"]).strip()
+        if len(ins) <= 400:  # dłuższy napis pomijamy zamiast go urywać
+            sent.append(f"Napis: „{ins}”")
     desc = t.get("description:pl") or p.get("_desc_translated") or t.get("description")
     if desc and looks_english(desc) and not t.get("description:pl"):
         desc = None  # angielski opis z OSM tylko po przetłumaczeniu (z kontrolą liczb)
     if desc and len(desc) > 15:
-        desc = desc.strip()
-        if len(desc) > 220:
-            desc = desc[:217].rsplit(" ", 1)[0].rstrip(",;:- ") + "..."
-        sent.append(desc.rstrip("."))
+        desc = full_sentences(desc, 600, 4) or (desc.strip() if len(desc) <= 300 else "")
+        if desc:
+            sent.append(desc.rstrip("."))
     if t.get("fee") == "no":
         sent.append("Wstęp bezpłatny")
     elif t.get("fee") == "yes":
         sent.append("Wstęp płatny")
     if t.get("opening_hours") and len(t["opening_hours"]) <= 60:
         sent.append(f"Godziny otwarcia: {t['opening_hours']}")
-    out = " ".join(s if s.endswith((".", "”", "...")) else s + "." for s in sent)
-    return out[:600]
+    # całe zdania; gdy za długo - pomijamy ostatnie zdania, nigdy nie tniemy w środku
+    parts = [x if x.endswith((".", "”", "!", "?")) else x + "." for x in sent if x]
+    out = []
+    for x in parts:
+        if out and len(" ".join(out)) + 1 + len(x) > DESC_MAX_CHARS:
+            break
+        out.append(x)
+    return " ".join(out)
 
 
 # ------------------------------------------------------------------ poziomy 1-2: Wikipedia
@@ -248,16 +252,21 @@ class Wiki:
         return {}
 
     def sitelinks(self, qids):
-        """QID -> {'pl': tytuł, 'en': tytuł, 'desc_pl': krótki opis po polsku, 'inception': '1889 r.'} (paczki po 50)."""
+        """QID -> {'pl': tytuł, 'en': tytuł, 'other': (język, tytuł), 'desc_pl': krótki opis po polsku,
+        'inception': '1889 r.'} (paczki po 50). 'other' = pierwsza dostępna Wikipedia z OTHER_WIKI_LANGS."""
         out = {}
         qids = [q for q in dict.fromkeys(qids) if re.fullmatch(r"Q\d+", q or "")]
         for i in range(0, len(qids), 50):
             data = self._get("https://www.wikidata.org/w/api.php", {
                 "action": "wbgetentities", "ids": "|".join(qids[i:i + 50]), "props": "sitelinks|descriptions|claims",
-                "sitefilter": "plwiki|enwiki", "languages": "pl"})
+                "sitefilter": "|".join(f"{l}wiki" for l in ["pl", "en"] + OTHER_WIKI_LANGS), "languages": "pl"})
             for qid, ent in (data.get("entities") or {}).items():
                 sl = ent.get("sitelinks") or {}
                 rec = {k[:2]: v.get("title") for k, v in sl.items() if k in ("plwiki", "enwiki")}
+                for lang in OTHER_WIKI_LANGS:
+                    if f"{lang}wiki" in sl:
+                        rec["other"] = (lang, sl[f"{lang}wiki"].get("title"))
+                        break
                 d = ((ent.get("descriptions") or {}).get("pl") or {}).get("value")
                 if d:
                     rec["desc_pl"] = d
@@ -288,6 +297,32 @@ class Wiki:
                         out[back[title]] = txt
             time.sleep(0.2)
         return out
+
+    def article_start(self, lang, title):
+        """Początek całego artykułu (do 10 zdań, także spoza wstępu) - na "Czytaj więcej".
+        Nagłówki sekcji są usuwane; tekst kończy się przed przypisami/bibliografią."""
+        data = self._get(f"https://{lang}.wikipedia.org/w/api.php", {
+            "action": "query", "prop": "extracts", "exsentences": "10", "explaintext": "1",
+            "exsectionformat": "raw", "redirects": "1", "titles": title})
+        for page in ((data.get("query") or {}).get("pages") or {}).values():
+            txt = page.get("extract") or ""
+            txt = re.split(r"\n=+\s*(Przypisy|Bibliografia|Linki zewnętrzne|Zobacz też|References|See also|External links)\s*=+", txt)[0]
+            txt = re.sub(r"\n=+[^=\n]+=+\s*", "\n", txt)
+            return txt.strip()
+        return ""
+
+
+# Wikipedie w innych językach (tłumaczone lokalnym modelem, z kontrolą liczb) - gdy brak PL i EN.
+# Kolejność = większe i rzetelniejsze wersje językowe najpierw.
+OTHER_WIKI_LANGS = ["de", "fr", "es", "it", "cs", "sk", "uk", "nl", "sv", "pt", "hu", "ro", "lt", "lv", "et", "fi",
+                    "no", "da", "hr", "sl", "sr", "bg", "el", "tr", "ru", "be", "ca", "eu", "gl", "ja", "zh", "ko"]
+LANG_NAMES_PL = {"en": "angielskiej", "de": "niemieckiej", "fr": "francuskiej", "es": "hiszpańskiej", "it": "włoskiej",
+                 "cs": "czeskiej", "sk": "słowackiej", "uk": "ukraińskiej", "nl": "niderlandzkiej", "sv": "szwedzkiej",
+                 "pt": "portugalskiej", "hu": "węgierskiej", "ro": "rumuńskiej", "lt": "litewskiej", "lv": "łotewskiej",
+                 "et": "estońskiej", "fi": "fińskiej", "no": "norweskiej", "da": "duńskiej", "hr": "chorwackiej",
+                 "sl": "słoweńskiej", "sr": "serbskiej", "bg": "bułgarskiej", "el": "greckiej", "tr": "tureckiej",
+                 "ru": "rosyjskiej", "be": "białoruskiej", "ca": "katalońskiej", "eu": "baskijskiej",
+                 "gl": "galicyjskiej", "ja": "japońskiej", "zh": "chińskiej", "ko": "koreańskiej"}
 
 
 def _wikidata_date(claims):
@@ -321,19 +356,72 @@ PRIORITY_SUB = ["castle", "palace", "museum", "art_museum", "viewpoint", "waterf
                 "archaeological_site", "theatre", "gallery", "garden", "park", "statue", "sculpture"]
 
 
-def short_text(txt, max_chars=420):
-    """Pierwsze zdania (2-3), bez wymowy w nawiasach i pustych nawiasów, do max_chars."""
+_ABBR = {"św", "pw", "ul", "im", "ok", "tzw", "r", "w", "wsp", "gen", "ks", "bł", "płk", "dr", "prof", "nr", "pl",
+         "al", "zm", "ur", "in", "m", "n", "p", "pn", "pd", "wsch", "zach", "woj", "pow", "gm", "par", "kpt", "por",
+         "mjr", "abp", "bp", "o", "s", "hr", "ppłk", "inż", "mgr", "tj", "np", "jw", "wg", "ds", "st", "mł", "kl", "ss",
+         "e", "ew", "jun", "sen", "ang", "łac", "niem", "fr", "lit", "ukr", "czes", "ros", "dz", "op", "cyt", "red", "itd", "itp", "dot"}
+
+
+def _split_sentences(txt):
+    """Dzieli na zdania, ale nie po skrótach (św., pw., im., ok., m.in., r.) ani inicjałach (J. Piłsudski)."""
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-ZĄĆĘŁŃÓŚŹŻ0-9„\"])", txt)
+    out = []
+    for p in parts:
+        if out:
+            last = re.search(r"(\S+)\.$", out[-1])
+            word = last.group(1).lower().split(".")[-1] if last else ""
+            year_end = re.search(r"(\d{3,4}|\b[IVXL]+)\s+(r|w)\.$", out[-1])  # "w 1995 r." / "w XVI w." kończy zdanie
+            if last and not year_end and (word in _ABBR or len(word) == 1 or out[-1].endswith("m.in.") or word.isdigit() and len(word) <= 2):
+                out[-1] = out[-1] + " " + p
+                continue
+        out.append(p)
+    return out
+
+
+DESC_MAX_CHARS = int(os.environ.get("DESC_MAX_CHARS", "1800"))  # pełny opis ("Czytaj więcej"), tylko pełne zdania
+DESC_MAX_SENTENCES = int(os.environ.get("DESC_MAX_SENTENCES", "10"))  # aplikacja pokazuje 2-3, reszta po "Czytaj więcej"
+SENTENCE_HARD_CAP = 1500  # pojedyncze zdanie dłuższe niż to = śmieć (np. lista), nie bierzemy go
+
+
+def full_sentences(txt, max_chars=None, max_sentences=None):
+    """Tylko PEŁNE zdania (nigdy cięcia w środku zdania ani na skrócie typu "św."), do max_chars.
+    Pierwsze zdanie zawsze w całości (o ile nie jest absurdalnie długie). Zwraca "" gdy nie ma pełnego zdania."""
+    max_chars = max_chars or DESC_MAX_CHARS
+    max_sentences = max_sentences or DESC_MAX_SENTENCES
     txt = re.sub(r"\s+", " ", txt or "").strip()
     txt = re.sub(r"\(\s*[;,]?\s*\)", "", txt)
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-ZĄĆĘŁŃÓŚŹŻ0-9„\"])", txt)
-    out = ""
-    for s in sentences:
-        if len(out) + len(s) + 1 > max_chars and out:
+    txt = re.sub(r"\s+([,.;:])", r"\1", txt)
+    out = []
+    for sent in _split_sentences(txt):
+        sent = sent.strip()
+        if not sent:
+            continue
+        if not out:
+            if len(sent) > SENTENCE_HARD_CAP:
+                return ""
+            out.append(sent)
+            continue
+        if len(out) >= max_sentences or len(" ".join(out)) + 1 + len(sent) > max_chars:
             break
-        out = (out + " " + s).strip()
-        if out.count(".") >= 3:
+        out.append(sent)
+    while len(out) > 1:
+        m = re.search(r"(\S+)\.$", out[-1])
+        w = m.group(1).lower().split(".")[-1] if m else ""
+        if m and not re.search(r"(\d{3,4}|\b[IVXL]+)\s+(r|w)\.$", out[-1]) and (w in _ABBR or len(w) == 1 or out[-1].endswith("m.in.")):
+            out.pop()
+        else:
             break
-    return out[:max_chars]
+    text = " ".join(out).strip()
+    # ostatnie zdanie musi być zamknięte (tekst z Wikipedii bywa obcięty przez autora/API)
+    if text and not text.endswith((".", "!", "?", "”", "\"", ")")):
+        closed = [x for x in out if x.endswith((".", "!", "?", "”", "\""))]
+        text = " ".join(closed).strip()
+    return text
+
+
+def short_text(txt, max_chars=None):
+    """Zgodność wsteczna: opis z pełnych zdań."""
+    return full_sentences(txt, max_chars)
 
 
 # ------------------------------------------------------------------ tłumaczenie (Ollama) z kontrolą faktów
@@ -346,8 +434,8 @@ def numbers_ok(source, translated):
     return True
 
 
-def translate_en_pl(text, name, url, model):
-    prompt = ("Przetłumacz poniższy tekst z angielskiej Wikipedii na naturalny język polski i skróć do 2-3 zdań. "
+def translate_en_pl(text, name, url, model, lang="en"):
+    prompt = (f"Przetłumacz poniższy tekst z {LANG_NAMES_PL.get(lang, 'obcojęzycznej')} Wikipedii na naturalny, poprawny język polski (od 3 do 10 pełnych zdań, zachowaj wszystkie ważne informacje). "
               "Używaj WYŁĄCZNIE informacji z tekstu. Nie dodawaj żadnych faktów, dat, liczb ani ocen. "
               f"Obiekt: {name}.\nTEKST:\n{text}\nTŁUMACZENIE:")
     body = json.dumps({"model": model, "prompt": prompt, "stream": False, "keep_alive": "1m", "options": {"temperature": 0.1}}).encode()
@@ -360,7 +448,7 @@ def translate_en_pl(text, name, url, model):
     out = re.sub(r"\s+", " ", out).strip().strip('"')
     if len(out) < 20 or not numbers_ok(text, out):
         return None
-    return out[:450]
+    return full_sentences(out) or None
 
 
 def proper_nouns_ok(source, text):
@@ -385,7 +473,7 @@ def proper_nouns_ok(source, text):
 
 def stylize_pl(facts, name, url, model):
     """2-3 zdania w stylu przewodnika WYŁĄCZNIE z podanych faktów; odrzuca tekst z nowymi liczbami/nazwami."""
-    prompt = ("Napisz 2-3 zdania po polsku w przyjaznym stylu przewodnika turystycznego o obiekcie, "
+    prompt = ("Napisz 3-5 pełnych zdań po polsku w przyjaznym stylu przewodnika turystycznego o obiekcie, "
               "używając WYŁĄCZNIE podanych faktów. Nie dodawaj żadnych dat, liczb, nazw, historii ani ocen, "
               "których nie ma w faktach. Nie zaczynaj od nazwy obiektu w cudzysłowie.\n"
               f"Obiekt: {name}\nFAKTY: {facts}\nOPIS:")
@@ -400,7 +488,7 @@ def stylize_pl(facts, name, url, model):
     source = f"{name} {facts}"
     if len(out) < 30 or not numbers_ok(source, out) or not proper_nouns_ok(source, out):
         return None
-    return out[:450]
+    return full_sentences(out) or None
 
 
 def ollama_available(url):
@@ -418,7 +506,7 @@ def enrich_descriptions(pois, log=print, places=None):
     contact = os.environ.get("WIKI_CONTACT", "").strip()
     llm_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
     llm_model = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
-    llm_max = int(os.environ.get("LLM_MAX_PER_TILE", "20"))
+    llm_max = int(os.environ.get("LLM_MAX_PER_TILE", "40"))
     # Opcjonalnie: przeredagowanie faktów OSM/Wikidata w styl przewodnika (0 = wyłączone; na CPU ok. 3-8 s/obiekt)
     style_max = int(os.environ.get("STYLE_MAX_PER_TILE", "0"))
     stats = {"wiki_pl": 0, "wiki_en_pl": 0, "osm": 0, "osm_styl": 0}
@@ -449,9 +537,19 @@ def enrich_descriptions(pois, log=print, places=None):
         pl_txt = wiki.extracts("pl", list(pl_title.values())) if pl_title else {}
         need_en = [i for i in en_title if i not in pl_title or pl_title[i] not in pl_txt]
         en_txt = wiki.extracts("en", [en_title[i] for i in need_en]) if need_en else {}
+        # inne języki: tylko gdy nie ma ani PL, ani EN
+        other_title = {}
+        for i, p in enumerate(pois):
+            o = (p.get("_wd") or {}).get("other")
+            if o and o[1] and not (i in pl_title and pl_title[i] in pl_txt) and not (i in en_title and en_txt.get(en_title[i])):
+                other_title[i] = o
+        other_txt = {}
+        for lang in sorted({o[0] for o in other_title.values()}):
+            got = wiki.extracts(lang, [o[1] for o in other_title.values() if o[0] == lang])
+            other_txt.update({(lang, t): v for t, v in got.items()})
     else:
         log("  ⚠️ Brak WIKI_CONTACT w .env - opisy tylko z danych OSM (poziom 3)")
-        pl_txt, en_txt, need_en = {}, {}, []
+        pl_txt, en_txt, need_en, other_title, other_txt = {}, {}, [], {}, {}
 
     def rank(i):
         sub = pois[i].get("sub_cat")
@@ -461,7 +559,8 @@ def enrich_descriptions(pois, log=print, places=None):
     en_queue = sorted([i for i in en_title if i not in has_pl and en_txt.get(en_title[i])], key=rank)
     osm_en_queue = sorted([i for i, p in enumerate(pois) if i not in has_pl and i not in en_title
                            and (p.get("tags") or {}).get("description") and looks_english(p["tags"]["description"])], key=rank)
-    llm_on = llm_max > 0 and bool(en_queue or osm_en_queue) and ollama_available(llm_url)
+    other_queue = sorted([i for i, o in other_title.items() if other_txt.get(o)], key=rank)
+    llm_on = llm_max > 0 and bool(en_queue or osm_en_queue or other_queue) and ollama_available(llm_url)
     translated = {}
     if llm_on:
         budget = llm_max
@@ -469,23 +568,48 @@ def enrich_descriptions(pois, log=print, places=None):
             if budget <= 0:
                 break
             budget -= 1
-            tr = translate_en_pl(short_text(en_txt[en_title[i]], 600), pois[i].get("name"), llm_url, llm_model)
+            tr = translate_en_pl(full_sentences(en_txt[en_title[i]], 2500, 12), pois[i].get("name"), llm_url, llm_model)
             if tr:
                 translated[i] = tr
+        for i in other_queue:
+            if budget <= 0:
+                break
+            budget -= 1
+            lang, title = other_title[i]
+            tr = translate_en_pl(full_sentences(other_txt[(lang, title)], 2500, 12), pois[i].get("name"), llm_url, llm_model, lang)
+            if tr:
+                translated[i] = tr
+                pois[i]["_tr_lang"] = lang
         for i in osm_en_queue:
             if budget <= 0:
                 break
             budget -= 1
-            tr = translate_en_pl(pois[i]["tags"]["description"][:600], pois[i].get("name"), llm_url, llm_model)
+            tr = translate_en_pl(full_sentences(pois[i]["tags"]["description"], 2500, 12) or pois[i]["tags"]["description"][:2500], pois[i].get("name"), llm_url, llm_model)
             if tr:
                 pois[i]["_desc_translated"] = tr
+    # "Czytaj więcej": gdy wstęp ma < 5 zdań, dobieramy dalszą część artykułu (najcenniejsze atrakcje najpierw)
+    long_max = int(os.environ.get("WIKI_LONG_MAX_PER_TILE", "200"))
+    if contact and long_max > 0:
+        short_ones = sorted([i for i in has_pl if len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))) < 5], key=rank)
+        got = 0
+        for i in short_ones[:long_max]:
+            try:
+                longer = wiki.article_start("pl", pl_title[i])
+            except Exception:
+                continue
+            if len(_split_sentences(full_sentences(longer))) > len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))):
+                pl_txt[pl_title[i]] = longer
+                got += 1
+            time.sleep(0.1)
+        if short_ones:
+            log(f"  [Opisy] dłuższe teksty z Wikipedii: {got}/{min(len(short_ones), long_max)}")
     for i, p in enumerate(pois):
         desc, src = None, None
         t = pl_title.get(i)
         if i in has_pl:
-            desc, src = short_text(pl_txt[t]), "wiki_pl"
+            desc, src = full_sentences(pl_txt[t]), "wiki_pl"
         elif i in translated:
-            desc, src = translated[i], "wiki_en_pl"
+            desc, src = translated[i], f"wiki_{p.get('_tr_lang', 'en')}_pl"
         if not desc or len(desc) < 25:
             desc, src = describe_from_osm(p), "osm"
         p["description"] = desc
@@ -498,7 +622,9 @@ def enrich_descriptions(pois, log=print, places=None):
             if styled:
                 pois[i]["description"], pois[i]["desc_source"] = styled, "osm_styl"
     for p in pois:
-        stats[p["desc_source"]] += 1
+        key = p["desc_source"] if p["desc_source"] in stats else "wiki_en_pl"
+        stats[key] += 1
     log(f"  [Opisy] Wikipedia PL: {stats['wiki_pl']} | tłumaczenia EN->PL: {stats['wiki_en_pl']} | "
+        f"(w tym z innych języków: {sum(1 for p in pois if p['desc_source'].startswith('wiki_') and p['desc_source'] not in ('wiki_pl', 'wiki_en_pl'))}) | "
         f"z danych OSM: {stats['osm']} | OSM w stylu przewodnika: {stats['osm_styl']}")
     return stats
