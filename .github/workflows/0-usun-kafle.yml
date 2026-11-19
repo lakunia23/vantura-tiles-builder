@@ -1,0 +1,33 @@
+name: "0. Usuń wszystkie kafle (przed budową od nowa)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      potwierdzenie:
+        description: "Wpisz USUN, aby usunąć WSZYSTKIE wydania z kaflami (kafle-...)"
+        required: true
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  usun:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Usuwanie wydań kafli
+        if: inputs.potwierdzenie == 'USUN'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName -q '.[].tagName' | grep '^kafle-' > tagi.txt || true
+          echo "Wydań do usunięcia: $(wc -l < tagi.txt)"
+          while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag && echo "usunięto $tag"
+          done < tagi.txt
+          echo "GOTOWE"
+      - name: Brak potwierdzenia
+        if: inputs.potwierdzenie != 'USUN'
+        run: |
+          echo "Nic nie usunięto - w polu potwierdzenia trzeba wpisać USUN"
+          exit 1
