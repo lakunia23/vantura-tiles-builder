@@ -78,21 +78,50 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q osmctools
           pip install osmium shapely
-      - name: Model językowy (tłumaczenia Wikipedii z innych języków)
-        if: vars.TLUMACZENIA_AI != '0'
+      - name: Pamięć podręczna tłumacza NLLB-200 (200 języków -> PL)
+        if: (vars.TLUMACZENIA_AI || '1') != '0'
+        uses: actions/cache@v4
+        with:
+          path: builder/nllb_ct2
+          key: nllb-200-distilled-600m-ct2-int8-v1
+      - name: Pobranie tłumacza NLLB-200 (szybkie tłumaczenia na CPU)
+        if: (vars.TLUMACZENIA_AI || '1') != '0'
+        continue-on-error: true
+        working-directory: builder
+        run: |
+          pip install -q ctranslate2 sentencepiece
+          mkdir -p nllb_ct2
+          BASE="https://huggingface.co/mydubber-org/nllb-200-distilled-600M-ct2-int8/resolve/main"
+          for f in config.json model.bin sentencepiece.bpe.model shared_vocabulary.json; do
+            [ -s "nllb_ct2/$f" ] || wget -q -O "nllb_ct2/$f" "$BASE/$f"
+          done
+          ls -lh nllb_ct2
+          python3 - <<'PY'
+          import time, sys
+          sys.path.insert(0, ".")
+          from enrich_pois_v2 import NllbTranslator
+          t0 = time.time()
+          tr = NllbTranslator("nllb_ct2")
+          assert tr.ok, "NLLB nie wystartował"
+          out = tr.translate("The castle was built in 1350 on a hill above the river.", "en")
+          print("TEST NLLB-200:", out, f"({time.time() - t0:.1f} s)")
+          tr.close()
+          PY
+      - name: Model językowy TranslateGemma 4B (najcenniejsze atrakcje)
+        if: (vars.TLUMACZENIA_AI || '1') != '0'
         continue-on-error: true
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           # serwer modelu: gdy usługa systemowa nie wystartowała, uruchamiamy go sami
           if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
-            nohup ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+            nohup ollama serve </dev/null > "$RUNNER_TEMP/ollama.log" 2>&1 &
           fi
           for i in $(seq 1 30); do curl -sf http://localhost:11434/api/tags > /dev/null && break; sleep 2; done
-          ollama pull qwen2.5:3b
-          # test: jedno krótkie tłumaczenie (czas widać w logu)
+          ollama pull translategemma:4b
+          # test: jedno krótkie tłumaczenie (czas i jakość widać w logu)
           start=$(date +%s)
-          curl -sf http://localhost:11434/api/generate -d '{"model":"qwen2.5:3b","prompt":"Przetłumacz na polski: The castle was built in 1350 on a hill above the river.","stream":false,"keep_alive":"30m"}' | python3 -c "import sys, json; print('TEST TŁUMACZENIA:', json.load(sys.stdin)['response'])"
-          echo "Czas testowego tłumaczenia: $(( $(date +%s) - start )) s"
+          curl -sf http://localhost:11434/api/chat -d '{"model":"translategemma:4b","messages":[{"role":"user","content":"You are a professional English (en) to Polish (pl) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Polish grammar, vocabulary, and cultural sensitivities. Keep proper nouns unchanged. Produce only the Polish translation, without any additional explanations or commentary. Please translate the following English text into Polish:\n\n\nVaduz Castle is the palace and official residence of the Prince of Liechtenstein. The castle gave its name to the town of Vaduz, the capital of Liechtenstein, which it overlooks from an adjacent hilltop."}],"stream":false,"keep_alive":0}' | python3 -c "import sys, json; print('TEST TRANSLATEGEMMA:', json.load(sys.stdin)['message']['content'])"
+          echo "Czas testowego tłumaczenia TranslateGemma: $(( $(date +%s) - start )) s"
       - name: GraphHopper z pamięci podręcznej
         uses: actions/cache@v4
         with:
@@ -114,15 +143,20 @@ jobs:
           PIN_COUNTRIES: ${{ inputs.kraje }}
           ONLY_TILES: ${{ matrix.tiles }}
           WORKERS: "1"
-          JAVA_XMX: ${{ vars.TLUMACZENIA_AI == '0' && '11g' || '9g' }}
+          JAVA_XMX: "11g"
           BUFFER_DEG: "0.4"
           USE_O5M: "0"
           DATA_MAX_GB: "40"
           GH_TIMEOUT_S: "7200"
-          LLM_MAX_PER_TILE: ${{ vars.TLUMACZENIA_AI == '0' && '0' || '500' }}
-          LLM_SECONDS_PER_TILE: "900"
-          WIKI_LONG_MAX_PER_TILE: "200"
-          STYLE_MAX_PER_TILE: "0"
+          OLLAMA_MODEL: "translategemma:4b"
+          NLLB_MODEL_DIR: "nllb_ct2"
+          LLM_MAX_PER_TILE: ${{ (vars.TLUMACZENIA_AI || '1') == '0' && '0' || '500' }}
+          LLM_SECONDS_PER_TILE: "720"
+          NLLB_MAX_PER_TILE: ${{ (vars.TLUMACZENIA_AI || '1') == '0' && '0' || '500' }}
+          NLLB_SECONDS_PER_TILE: "420"
+          WIKI_LONG_MAX_PER_TILE: "250"
+          WIKI_FOREIGN_LONG_MAX: "100"
+          WIKI_GEOSEARCH_MAX: "120"
           MAX_RUNTIME_S: "18900"
         run: |
           python -u BuildWorldGrid_v2.py
