@@ -35,6 +35,7 @@ Koszty R2: wysyłka jednym zapytaniem PUT (1 operacja klasy A na kafel zamiast ~
 import os
 import sys
 import gc
+import gzip
 import math
 import json
 import time
@@ -185,7 +186,19 @@ def load_catalog():
     index_file = os.path.join(DATA_DIR, "geofabrik_index.json")
     if not os.path.exists(index_file) or os.path.getsize(index_file) < 1000:
         log("Pobieranie indeksu Geofabrik...")
-        urllib.request.urlretrieve("https://download.geofabrik.de/index-v1.json", index_file)
+        last_err = None
+        for attempt in range(1, 6):
+            try:
+                urllib.request.urlretrieve("https://download.geofabrik.de/index-v1.json", index_file)
+                if os.path.exists(index_file) and os.path.getsize(index_file) >= 1000:
+                    last_err = None
+                    break
+            except Exception as e:
+                last_err = e
+                log(f"  ⚠️ Błąd pobierania indeksu Geofabrik (próba {attempt}/5): {e}")
+                time.sleep(5 * attempt)
+        if last_err is not None:
+            raise last_err
     with open(index_file, "r", encoding="utf-8") as f:
         data = json.load(f)
     continents = {"europe", "north-america", "south-america", "asia", "africa", "australia-oceania", "central-america"}
@@ -441,15 +454,87 @@ def upload_verified(path, name):
     return False
 
 
+def tile_already_exists(lat, lon):
+    name = archive_name(format_tile_id(lat, lon))
+    if DRY_RUN:
+        return False
+    return (name in github_assets(release_tag(lat, lon))) if UPLOAD_TARGET == "github" else tile_exists_in_r2(name)
+
+
+def tr_cache_name(tile_id):
+    return f"tr_{tile_id}_{LANG}.json.gz"
+
+
+def load_tr_cache(lat, lon):
+    """Pobiera pamięć tłumaczeń (własną z poprzedniej rundy + z 8 sąsiednich kafli),
+    aby wznawiać gęste kafle i nie tłumaczyć tych samych obiektów w zakładkach."""
+    merged = {}
+    if DRY_RUN:
+        return merged
+    # najpierw sąsiedzi, na końcu własny kafel (ma pierwszeństwo)
+    offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if not (dy == 0 and dx == 0)] + [(0, 0)]
+    for dy, dx in offsets:
+        la, lo = lat + dy, lon + dx
+        if la < -90 or la >= 90 or lo < -180 or lo >= 180:
+            continue
+        tid = format_tile_id(la, lo)
+        cname = tr_cache_name(tid)
+        if UPLOAD_TARGET == "github":
+            tag = release_tag(la, lo)
+            if cname not in github_assets(tag):
+                continue
+            tmp = os.path.join(TEMP_DIR, f"dl_{cname}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                res = _gh(["release", "download", tag, "-p", cname, "-O", tmp], check=False)
+                if res.returncode == 0 and os.path.exists(tmp):
+                    with gzip.open(tmp, "rt", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if isinstance(d, dict):
+                        merged.update(d)
+            except Exception:
+                pass
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+        else:
+            local_p = os.path.join(WORK_DIR, cname)
+            if os.path.exists(local_p):
+                try:
+                    with gzip.open(local_p, "rt", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if isinstance(d, dict):
+                        merged.update(d)
+                except Exception:
+                    pass
+    return merged
+
+
+def save_tr_cache(lat, lon, tile_id, tr_dict):
+    if DRY_RUN or not tr_dict:
+        return
+    cname = tr_cache_name(tile_id)
+    tmp = os.path.join(WORK_DIR, cname)
+    try:
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(tr_dict, f, ensure_ascii=False)
+        if UPLOAD_TARGET == "github":
+            github_upload(tmp, cname, lat, lon)
+    except Exception as e:
+        log(f"  ⚠️ Nie udało się zapisać pamięci tłumaczeń {cname}: {e}")
+
+
 # ------------------------------------------------------------------ budowa jednego kafla
 def build_tile(lat, lon, sources, force):
     tile_id = format_tile_id(lat, lon)
     name = archive_name(tile_id)
-    if not force:
-        exists = (name in github_assets(release_tag(lat, lon))) if UPLOAD_TARGET == "github" else tile_exists_in_r2(name)
-        if exists:
-            log(f"  ✓ {name} już istnieje - pomijam")
-            return True
+    if not force and tile_already_exists(lat, lon):
+        log(f"  ✓ {name} już istnieje - pomijam")
+        return True
 
     b = BUFFER_DEG
     min_lat, min_lon, max_lat, max_lon = lat - b, lon - b, lat + 1 + b, lon + 1 + b
@@ -504,13 +589,25 @@ def build_tile(lat, lon, sources, force):
         if poi_count == 0 and osm_size < 100 * 1024:
             log(f"  🌊 {tile_id}: morze/pustkowie (0 POI, {osm_size} B) - pomijam")
             return True
-        # Opisy: Wikipedia PL -> obcojęzyczna Wikipedia (TranslateGemma + NLLB-200) -> bogate dane OSM/Wikidata.
-        enrich_descriptions(
+        # Opisy: Wikipedia PL -> obcojęzyczna Wikipedia/OSM/Wikidata (wyłącznie TranslateGemma 4B, każdy punkt,
+        # bez rang, ze wznawianą pamięcią tłumaczeń tr_<KAFEL>_pl.json.gz współdzieloną z sąsiadami).
+        tr_max_s = int(os.environ.get("TRANSLATE_MAX_S", "0"))
+        deadline_ts = (START_TIME + tr_max_s) if tr_max_s > 0 else None
+        tr_cache = load_tr_cache(lat, lon)
+        if tr_cache:
+            log(f"  [Cache tłumaczeń] wczytano {len(tr_cache)} wpisów (własny / sąsiednie kafle)")
+        enrich_stats = enrich_descriptions(
             scanner.pois, log,
             places=scanner.places,
             geo_wiki=scanner.geo_wiki,
             protected_areas=scanner.protected_areas,
+            tr_cache=tr_cache,
+            save_cache=lambda d: save_tr_cache(lat, lon, tile_id, d),
+            deadline_ts=deadline_ts,
         )
+        if enrich_stats.get("incomplete"):
+            log(f"  ⏸️ {tile_id}: tłumaczenia w toku (postęp zapisany w {tr_cache_name(tile_id)}) — kolejna runda dokończy resztę")
+            return False
         conn = sqlite3.connect(poi_db)
         cur = conn.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS pois (
@@ -784,9 +881,13 @@ def main():
 
     def run_tile(la, lo, tile_id, sources):
         ok = False
+        tr_max_s = int(os.environ.get("TRANSLATE_MAX_S", "0"))
         for attempt in range(1, 4):
             ok = build_tile(la, lo, sources, force)
             if ok:
+                break
+            if (tr_max_s and time.time() >= START_TIME + tr_max_s) or (MAX_RUNTIME_S and time.time() - START_TIME > MAX_RUNTIME_S):
+                log(f"  ⏸️ {tile_id}: zatrzymano z powodu limitu czasu zadania — dokończy kolejna runda")
                 break
             log(f"  ❌ {tile_id} próba {attempt}/3 nieudana")
             time.sleep(10)
@@ -826,6 +927,10 @@ def main():
                 if MAX_RUNTIME_S and time.time() - START_TIME > MAX_RUNTIME_S:
                     log(f"[Czas] Limit czasu zadania - {tile_id} i kolejne zbudują się w następnym uruchomieniu")
                     break
+                if not force and tile_already_exists(la, lo):
+                    log(f"  ✓ {archive_name(tile_id)} już istnieje - pomijam (bez pobierania map)")
+                    done.add(tile_id)
+                    continue
                 wait_for_slot(WORKERS)
                 tiles_since_check += 1
                 if tiles_since_check >= 25:

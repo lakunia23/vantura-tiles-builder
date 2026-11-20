@@ -1,26 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VANTURA - OPISY ATRAKCJI v2.1 (etap budowy kafla)
+VANTURA - OPISY ATRAKCJI v2.2 (etap budowy kafla)
 
 Zasada: opis ma być PRAWDZIWY, ciekawy i po polsku (nazwy własne bez zmian).
 Aplikacja wyświetla średnio do 3 zdań podsumowania, a gdy opis ma więcej niż 3 zdania -
 przycisk "Czytaj więcej" rozwija pełny, szczegółowy opis (do 10 zdań).
 
-Cztery źródła faktów, od najlepszego:
+Źródła faktów, bez rang i bez ucinania punktów:
   1. Polska Wikipedia (do 10 zdań) - przez tag wikidata/wikipedia z OSM, relacje multipolygon,
      dziedziczenie z sąsiedniego budynku (<= 60 m) oraz bezpieczny GeoSearch (współrzędne + nazwa).
-  2. Obcojęzyczna Wikipedia (EN + 40 języków, do 10 zdań) - tłumaczona hybrydowo:
-     - TranslateGemma 4B (Ollama) dla najcenniejszych atrakcji (jakość wydawnicza),
-     - NLLB-200-distilled-600M (CTranslate2 INT8) dla pozostałych artykułów, krótkich opisów
-       Wikidata (desc_en) oraz obcojęzycznych opisów z OSM (szybko na CPU, 200 języków).
-     Kontrola liczb chroni przed zmyślonymi datami i wymiarami.
+  2. Obcojęzyczna Wikipedia (EN + ponad 40 języków, do 10 zdań), obcojęzyczne opisy OSM oraz
+     krótkie opisy Wikidata (desc_en) - tłumaczone dla KAŻDEGO punktu wyłącznie przez TranslateGemma 4B
+     (Ollama) z zachowaniem nazw własnych, kontrolą liczb oraz wznawialną pamięcią tłumaczeń
+     (tr_<KAFEL>_pl.json.gz współdzieloną z sąsiednimi kaflami i wznawianą między rundami).
   3. Bogate dane OpenStreetMap + Wikidata (styl architektoniczny, status UNESCO, pasmo górskie,
      park narodowy/rezerwat, typ zamku/muzeum, materiał, architekt/twórca, kierunek panoramy,
      długość jaskini, wybitność szczytu, godziny otwarcia, wstęp, inskrypcje).
 Bez zdjęć (image_url = NULL) - aplikacja pobiera zdjęcie sama przy otwarciu atrakcji.
 """
 import gc
+import gzip
+import hashlib
 import json
 import math
 import os
@@ -664,7 +665,7 @@ def describe_from_osm(p):
         if oh:
             sent.append(f"Godziny otwarcia: {oh}")
 
-    parts = [x if x.endswith((".", "!", "?")) else x + "." for x in sent if x]
+    parts = [x if x.endswith((".", "!", "?", ".”", "!”", "?”")) else x + "." for x in sent if x]
     out = []
     for x in parts:
         if out and len(" ".join(out)) + 1 + len(x) > DESC_MAX_CHARS:
@@ -772,7 +773,7 @@ def _claim_amount(claims, prop):
 
 class Wiki:
     def __init__(self, contact, log=print):
-        self.ua = f"VanturaTileBuilder/2.1 (offline route planner tiles; contact: {contact})"
+        self.ua = f"VanturaTileBuilder/2.2 (offline route planner tiles; contact: {contact})"
         self.log = log
 
     def _get(self, url, params):
@@ -780,9 +781,12 @@ class Wiki:
         full = url + "?" + urllib.parse.urlencode(params)
         for attempt in range(6):
             try:
-                req = urllib.request.Request(full, headers={"User-Agent": self.ua, "Accept-Encoding": "identity"})
+                req = urllib.request.Request(full, headers={"User-Agent": self.ua, "Accept-Encoding": "gzip"})
                 with urllib.request.urlopen(req, timeout=60) as r:
-                    data = json.loads(r.read().decode("utf-8"))
+                    raw = r.read()
+                    if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                        raw = gzip.decompress(raw)
+                    data = json.loads(raw.decode("utf-8"))
                 if data.get("error", {}).get("code") == "maxlag":
                     time.sleep(5 * (attempt + 1))
                     continue
@@ -797,16 +801,41 @@ class Wiki:
                 time.sleep(5 * (attempt + 1))
         return {}
 
+    def _wbgetentities_safe(self, chunk, extra_params):
+        """Bezpieczne wbgetentities: gdy 1 błędne/usunięte QID z OSM wywoła 'no-such-entity',
+        usuwa samo wadliwe ID i pobiera pozostałe 49 encji (nic nie ginie!)."""
+        pending = [list(chunk)]
+        entities = {}
+        while pending:
+            cur = pending.pop()
+            if not cur:
+                continue
+            params = dict(extra_params, action="wbgetentities", ids="|".join(cur))
+            data = self._get("https://www.wikidata.org/w/api.php", params)
+            err = data.get("error") or {}
+            if err.get("code") == "no-such-entity":
+                bad_id = err.get("id")
+                if bad_id and bad_id in cur:
+                    rem = [q for q in cur if q != bad_id]
+                    if rem:
+                        pending.append(rem)
+                elif len(cur) > 1:
+                    mid = len(cur) // 2
+                    pending.append(cur[mid:])
+                    pending.append(cur[:mid])
+                continue
+            for qid, ent in (data.get("entities") or {}).items():
+                if not ent.get("missing"):
+                    entities[qid] = ent
+        return entities
+
     def labels_pl(self, qids):
         """Pobiera polskie (albo angielskie jako fallback) etykiety dla zbioru QID (paczki po 50)."""
         out = {}
         qids = [q for q in dict.fromkeys(qids) if re.fullmatch(r"Q\d+", q or "")]
         for i in range(0, len(qids), 50):
-            data = self._get("https://www.wikidata.org/w/api.php", {
-                "action": "wbgetentities", "ids": "|".join(qids[i:i + 50]),
-                "props": "labels", "languages": "pl|en",
-            })
-            for qid, ent in (data.get("entities") or {}).items():
+            ents = self._wbgetentities_safe(qids[i:i + 50], {"props": "labels", "languages": "pl|en"})
+            for qid, ent in ents.items():
                 labs = ent.get("labels") or {}
                 val = (labs.get("pl") or labs.get("en") or {}).get("value")
                 if val:
@@ -821,12 +850,11 @@ class Wiki:
         qids = [q for q in dict.fromkeys(qids) if re.fullmatch(r"Q\d+", q or "")]
         sitefilter = "|".join(f"{l}wiki" for l in ["pl", "en"] + OTHER_WIKI_LANGS)
         for i in range(0, len(qids), 50):
-            data = self._get("https://www.wikidata.org/w/api.php", {
-                "action": "wbgetentities", "ids": "|".join(qids[i:i + 50]),
+            ents = self._wbgetentities_safe(qids[i:i + 50], {
                 "props": "sitelinks|descriptions|claims|labels",
                 "sitefilter": sitefilter, "languages": "pl|en",
             })
-            for qid, ent in (data.get("entities") or {}).items():
+            for qid, ent in ents.items():
                 sl = ent.get("sitelinks") or {}
                 rec = {k[:2]: v.get("title") for k, v in sl.items() if k in ("plwiki", "enwiki")}
                 for lang in OTHER_WIKI_LANGS:
@@ -1196,7 +1224,7 @@ def ollama_unload(url, model):
         pass
 
 
-def translate_ollama(text, name, url, model, lang="en", source="wiki"):
+def translate_ollama(text, name, url, model, lang="en", source="wiki", min_len=20):
     """Tłumaczenie przez Ollamę: obsługuje oficjalny format TranslateGemma (wysoka jakość polskiego)
     oraz ogólne modele (np. qwen2.5:3b) jako fallback."""
     text = full_sentences(text, 2000, 10) or text[:2000]
@@ -1246,13 +1274,14 @@ def translate_ollama(text, name, url, model, lang="en", source="wiki"):
         return None
 
     out = clean_wiki_text(out).strip('"')
-    if len(out) < 20:
+    if len(out) < min_len:
         _tr_stat("llm:pusta")
         return None
     if not numbers_ok(text, out):
         _tr_stat("llm:odrzucone-liczby")
         return None
-    res = full_sentences(out) or None
+    res = full_sentences(out) if (source == "wiki" or len(out) >= 40) else out
+    res = res or (out if source != "wiki" else None)
     _tr_stat("llm:udane" if res else "llm:bez-zdań")
     return res
 
@@ -1262,94 +1291,13 @@ def translate_en_pl(text, name, url, model, lang="en", source="wiki"):
     return translate_ollama(text, name, url, model, lang, source)
 
 
-class NllbTranslator:
-    """Szybki tłumacz neuronowy NLLB-200-distilled-600M (CTranslate2 INT8 + SentencePiece) na CPU.
-    Obsługuje 200 języków, ~1-3 s na artykuł, zero halucynacji, ~1.2 GB RAM."""
-
-    def __init__(self, model_dir, log=print):
-        self.ok = False
-        self.translator = None
-        self.sp = None
-        if not model_dir or not os.path.isdir(model_dir):
-            return
-        sp_path = os.path.join(model_dir, "sentencepiece.bpe.model")
-        bin_path = os.path.join(model_dir, "model.bin")
-        if not (os.path.exists(sp_path) and os.path.exists(bin_path)):
-            return
-        try:
-            import ctranslate2
-            import sentencepiece as spm
-            self.sp = spm.SentencePieceProcessor()
-            self.sp.load(sp_path)
-            threads = max(1, min(4, os.cpu_count() or 4))
-            self.translator = ctranslate2.Translator(
-                model_dir, device="cpu", compute_type="int8", intra_threads=threads, inter_threads=1
-            )
-            self.ok = True
-        except Exception as e:
-            log(f"  ⚠️ NLLB-200 niedostępny ({e})")
-
-    def translate(self, text, lang="en", max_sentences=10, min_len=12):
-        if not self.ok or not text:
-            return None
-        src_code = NLLB_LANG.get(lang)
-        if not src_code or src_code == "pol_Latn":
-            return None
-        sents = _split_sentences(clean_wiki_text(text))[:max_sentences]
-        sents = [s.strip() for s in sents if len(s.strip()) >= 3]
-        if not sents:
-            return None
-        try:
-            pieces = [[src_code] + self.sp.encode_as_pieces(s)[:380] + ["</s>"] for s in sents]
-            results = self.translator.translate_batch(
-                pieces,
-                batch_type="tokens",
-                max_batch_size=1024,
-                beam_size=2,
-                max_decoding_length=320,
-                repetition_penalty=1.1,
-                no_repeat_ngram_size=3,
-                target_prefix=[["pol_Latn"]] * len(pieces),
-            )
-            out_sents = []
-            for res in results:
-                toks = res.hypotheses[0]
-                if toks and toks[0] == "pol_Latn":
-                    toks = toks[1:]
-                decoded = clean_wiki_text(self.sp.decode(toks))
-                if decoded:
-                    out_sents.append(decoded)
-            out = " ".join(out_sents).strip()
-        except Exception as e:
-            _tr_stat(f"nllb:błąd ({type(e).__name__})")
-            return None
-        if len(out) < min_len:
-            _tr_stat("nllb:pusta")
-            return None
-        if not numbers_ok(text, out):
-            _tr_stat("nllb:odrzucone-liczby")
-            return None
-        res = full_sentences(out) if len(out) >= 25 else out
-        _tr_stat("nllb:udane" if res else "nllb:bez-zdań")
-        return res or None
-
-    def close(self):
-        self.translator = None
-        self.sp = None
-        self.ok = False
-
-
 # ------------------------------------------------------------------ bezpieczny Wikipedia GeoSearch
 def geosearch_missing(pois, wiki, pl_title, en_title, other_title, log=print):
-    """Dla najcenniejszych niepowiązanych POI (bez wikidata/wikipedia) szuka artykułu w Wikipedii
-    po współrzędnych (<= 200 m, szczyty <= 350 m) i ścisłej zgodności nazwy własnej (bez nazwy miasta)."""
-    max_q = int(os.environ.get("WIKI_GEOSEARCH_MAX", "120"))
+    """Dla niepowiązanych POI (bez wikidata/wikipedia) szuka artykułu w Wikipedii
+    po współrzędnych (<= 180 m, szczyty <= 350 m) i ścisłej zgodności nazwy własnej (bez nazwy miasta)."""
+    max_q = int(os.environ.get("WIKI_GEOSEARCH_MAX", "200"))
     if max_q <= 0:
         return 0
-
-    def rank(i):
-        sub = pois[i].get("sub_cat")
-        return PRIORITY_SUB.index(sub) if sub in PRIORITY_SUB else len(PRIORITY_SUB)
 
     cands = [
         i for i, p in enumerate(pois)
@@ -1360,9 +1308,8 @@ def geosearch_missing(pois, wiki, pl_title, en_title, other_title, log=print):
     ]
     if not cands:
         return 0
-    cands.sort(key=rank)
 
-    # Wybierz języki do GeoSearch: zawsze PL (jeśli są polskie artykuły w kaflu) + EN + dominujący język lokalny
+    # Wybierz języki do GeoSearch: zawsze PL (jeśli są polskie artykuły w kaflu) + dominujący lokalny + EN
     langs = []
     if len(pl_title) >= 5:
         langs.append("pl")
@@ -1375,14 +1322,14 @@ def geosearch_missing(pois, wiki, pl_title, en_title, other_title, log=print):
             langs.append(top_local)
     if "en" not in langs:
         langs.append("en")
-    langs = langs[:2]  # maks. 2 języki na kafel (szybkość i uprzejmość wobec API)
+    langs = langs[:2]
 
-    # Klasteryzacja po komórkach ~600 m, żeby 1 zapytanie obsłużyło wiele sąsiednich POI w centrum miasta
+    # Klasteryzacja po komórkach ~600 m, żeby 1 zapytanie obsłużyło wszystkie sąsiednie POI
     clusters = {}
     for i in cands:
         key = (int(pois[i]["lat"] * 160), int(pois[i]["lng"] * 100))
         clusters.setdefault(key, []).append(i)
-    ordered_clusters = sorted(clusters.values(), key=lambda idxs: rank(idxs[0]))
+    ordered_clusters = sorted(clusters.values(), key=lambda idxs: -len(idxs))
 
     queries = 0
     found = 0
@@ -1429,7 +1376,6 @@ def geosearch_missing(pois, wiki, pl_title, en_title, other_title, log=print):
                     if not ttoks:
                         continue
                     ov = _stems_overlap(ptoks, ttoks)
-                    # Ścisła reguła: wszystkie słowa własne przy krótkiej nazwie, albo min. 2 (lub 1 długie >= 6 znaków)
                     need = 1 if (len(ptoks) == 1 and max(len(w) for w in ptoks) >= 5) else min(2, len(ptoks))
                     if ov >= need:
                         best_title, best_dist = title, dist
@@ -1446,16 +1392,25 @@ def geosearch_missing(pois, wiki, pl_title, en_title, other_title, log=print):
     return found
 
 
+def _txt_cache_key(lang, src_txt):
+    return f"txt:{lang}:{hashlib.md5(src_txt.encode('utf-8')).hexdigest()[:12]}"
+
+
 # ------------------------------------------------------------------ główna funkcja etapu
-def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_areas=None):
-    """Ustawia p['description'] i p['desc_source'] ('wiki_pl' | 'wiki_<lang>_pl' | 'osm') dla każdego POI."""
+def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_areas=None,
+                        tr_cache=None, save_cache=None, deadline_ts=None):
+    """Ustawia p['description'] i p['desc_source'] ('wiki_pl' | 'wiki_<lang>_pl' | 'osm') dla KAŻDEGO POI.
+    Bez rang i bez ucinania punktów: wszystkie obcojęzyczne artykuły Wikipedii, opisy OSM i opisy Wikidata
+    są tłumaczone wyłącznie przez TranslateGemma 4B (Ollama). Jeśli bardzo gęsty kafel osiągnie limit czasu
+    zadania (deadline_ts), zapisuje postęp w pamięci tłumaczeń (save_cache) i zwraca stats['incomplete']=True,
+    aby kolejna runda dokończyła resztę bez powtarzania już przetłumaczonych punktów."""
     contact = os.environ.get("WIKI_CONTACT", "").strip()
     llm_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
     llm_model = os.environ.get("OLLAMA_MODEL", "translategemma:4b")
-    llm_max = int(os.environ.get("LLM_MAX_PER_TILE", "500"))
-    nllb_dir = os.environ.get("NLLB_MODEL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "nllb_ct2"))
-    nllb_max = int(os.environ.get("NLLB_MAX_PER_TILE", "500")) if llm_max > 0 else 0
-    stats = {"wiki_pl": 0, "wiki_en_pl": 0, "osm": 0}
+    llm_max = int(os.environ.get("LLM_MAX_PER_TILE", "999999"))
+    stats = {"wiki_pl": 0, "wiki_en_pl": 0, "osm": 0, "incomplete": False}
+    cache = dict(tr_cache) if tr_cache else {}
+    local_tr = {}
 
     attach_locality(pois, places or [])
     attach_protected_area(pois, protected_areas or [])
@@ -1478,6 +1433,8 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
                     osm_other_title[i] = (lang, title)
         qids = [p.get("wikidata") for p in pois if p.get("wikidata")]
         links = wiki.sitelinks(qids) if qids else {}
+        if qids:
+            log(f"  [Wikidata] pobrano encji: {len(links)}/{len(set(qids))}")
         for i, p in enumerate(pois):
             sl = links.get(p.get("wikidata") or "", {})
             if sl.get("pl"):
@@ -1493,13 +1450,11 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
             if o and o[1] and i not in pl_title and i not in en_title:
                 other_title.setdefault(i, o)
 
-        # Bezpieczny GeoSearch dla najważniejszych punktów bez wikidata/wikipedia
         geosearch_missing(pois, wiki, pl_title, en_title, other_title, log)
 
         pl_txt = wiki.extracts("pl", list(pl_title.values())) if pl_title else {}
         need_en = [i for i in en_title if i not in pl_title or pl_title[i] not in pl_txt]
         en_txt = wiki.extracts("en", [en_title[i] for i in need_en]) if need_en else {}
-        # dla pozostałych (brak działającego PL i EN) pobierz inne języki
         for i, p in enumerate(pois):
             o = (p.get("_wd") or {}).get("other")
             if o and o[1] and not (i in pl_title and pl_title[i] in pl_txt) and not (i in en_title and en_txt.get(en_title[i])):
@@ -1517,18 +1472,16 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
         log("  ⚠️ Brak WIKI_CONTACT - opisy tylko z danych OSM (poziom 3)")
         pl_txt, en_txt, other_title, other_txt = {}, {}, {}, {}
 
-    def rank(i):
-        sub = pois[i].get("sub_cat")
-        return (PRIORITY_SUB.index(sub) if sub in PRIORITY_SUB else len(PRIORITY_SUB), 0 if pois[i].get("wikidata") else 1)
-
     has_pl = {i for i, t in pl_title.items() if pl_txt.get(t)}
 
-    # "Czytaj więcej" (do 10 zdań) dla polskiej Wikipedii, gdy wstęp jest krótki (< 5 zdań)
-    long_max = int(os.environ.get("WIKI_LONG_MAX_PER_TILE", "250"))
+    # "Czytaj więcej" (do 10 zdań) dla KAŻDEGO artykułu polskiej Wikipedii o krótkim wstępie (< 5 zdań)
+    long_max = int(os.environ.get("WIKI_LONG_MAX_PER_TILE", "10000"))
     if wiki and long_max > 0:
-        short_ones = sorted([i for i in has_pl if len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))) < 5], key=rank)
+        short_ones = [i for i in has_pl if len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))) < 5]
         got = 0
         for i in short_ones[:long_max]:
+            if deadline_ts and time.time() >= deadline_ts:
+                break
             try:
                 longer = wiki.article_start("pl", pl_title[i])
             except Exception:
@@ -1536,150 +1489,208 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
             if len(_split_sentences(full_sentences(longer))) > len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))):
                 pl_txt[pl_title[i]] = longer
                 got += 1
-            time.sleep(0.08)
+            time.sleep(0.06)
         if short_ones:
             log(f"  [Opisy] dłuższe teksty z polskiej Wikipedii (do 10 zdań): {got}/{min(len(short_ones), long_max)}")
 
-    en_queue = sorted([i for i in en_title if i not in has_pl and en_txt.get(en_title[i])], key=rank)
-    other_queue = sorted([i for i, o in other_title.items() if other_txt.get(o)], key=rank)
-    osm_tr_queue = sorted([
+    # Kolejki wszystkich punktów wymagających tłumaczenia (BEZ rang i BEZ ucinania kategorii!)
+    en_queue = [i for i in en_title if i not in has_pl and en_txt.get(en_title[i])]
+    other_queue = [i for i, o in other_title.items() if other_txt.get(o)]
+    osm_tr_queue = [
         i for i, p in enumerate(pois)
         if i not in has_pl and i not in en_title and i not in other_title
         and ((p.get("tags") or {}).get("description:en") or (p.get("tags") or {}).get("description"))
         and not (p.get("tags") or {}).get("description:pl")
         and len(((p.get("tags") or {}).get("description:en") or (p.get("tags") or {}).get("description") or "")) > 20
         and not looks_polish((p.get("tags") or {}).get("description:en") or (p.get("tags") or {}).get("description") or "")
-    ], key=rank)
-    wd_en_queue = sorted([
+    ]
+    wd_en_queue = [
         i for i, p in enumerate(pois)
         if i not in has_pl and i not in en_title and i not in other_title
         and (p.get("_wd") or {}).get("desc_en") and not (p.get("_wd") or {}).get("desc_pl")
-    ], key=rank)
+    ]
 
-    # Dłuższe teksty (do 10 zdań) także dla topowych artykułów z obcojęzycznej Wikipedii (gdy tłumaczenia są włączone)
-    foreign_long_max = int(os.environ.get("WIKI_FOREIGN_LONG_MAX", "100"))
-    if wiki and llm_max > 0 and foreign_long_max > 0 and (en_queue or other_queue):
-        f_jobs = sorted(
-            [(rank(i), "en", i) for i in en_queue] + [(rank(i), "other", i) for i in other_queue],
-            key=lambda j: j[0],
-        )
-        fgot = 0
-        fchecked = 0
-        for _, kind, i in f_jobs:
-            if fchecked >= foreign_long_max:
-                break
-            lang = "en" if kind == "en" else other_title[i][0]
-            title = en_title[i] if kind == "en" else other_title[i][1]
-            cur_txt = en_txt[title] if kind == "en" else other_txt[(lang, title)]
-            if len(_split_sentences(full_sentences(cur_txt))) >= 4:
-                continue
-            fchecked += 1
-            try:
-                longer = wiki.article_start(lang, title)
-            except Exception:
-                continue
-            if len(_split_sentences(full_sentences(longer))) > len(_split_sentences(full_sentences(cur_txt))):
-                if kind == "en":
-                    en_txt[title] = longer
-                else:
-                    other_txt[(lang, title)] = longer
-                fgot += 1
-            time.sleep(0.08)
-        if fchecked:
-            log(f"  [Opisy] dłuższe teksty z obcej Wikipedii (do 10 zdań): {fgot}/{fchecked}")
-
-    # Hybrydowe tłumaczenia:
-    #   1) TranslateGemma / Ollama (jakość wydawnicza) dla topowych atrakcji w limicie czasu,
-    #   2) NLLB-200 CTranslate2 (szybkie na CPU) dla pozostałych artykułów + desc_en z Wikidata + opisów OSM!
+    # Zastosuj istniejące tłumaczenia z pamięci (własnej z poprzedniej rundy + sąsiednich kafli)
     translated = {}
+    cache_hits = 0
+    todo_wiki = []
+    seen_wiki_keys = set()
+    for kind, i in ([("en", i) for i in en_queue] + [("other", i) for i in other_queue]):
+        lang = "en" if kind == "en" else other_title[i][0]
+        title = en_title[i] if kind == "en" else other_title[i][1]
+        wkey = f"wiki:{lang}:{title}"
+        wd_id = pois[i].get("wikidata")
+        wdkey = f"wd:{wd_id}" if wd_id else None
+        hit = cache.get(wkey) or (cache.get(wdkey) if wdkey else None)
+        if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
+            translated[i] = hit[1]
+            if hit[0] and hit[0] != "en":
+                pois[i]["_tr_lang"] = hit[0]
+            local_tr[wkey] = hit
+            if wdkey:
+                local_tr[wdkey] = hit
+            cache_hits += 1
+        else:
+            todo_wiki.append((kind, i, lang, title, wkey, wdkey))
+
+    todo_osm = []
+    for i in osm_tr_queue:
+        t = pois[i].get("tags") or {}
+        src_d = t.get("description:en") or t.get("description")
+        dlang = "en" if (t.get("description:en") or looks_english(src_d)) else "de"
+        ckey = _txt_cache_key(dlang, src_d)
+        hit = cache.get(ckey)
+        if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
+            pois[i]["_desc_translated"] = hit[1]
+            local_tr[ckey] = hit
+            cache_hits += 1
+        else:
+            todo_osm.append((i, dlang, src_d, ckey))
+
+    todo_wd = []
+    for i in wd_en_queue:
+        src_d = pois[i]["_wd"]["desc_en"]
+        ckey = _txt_cache_key("en", src_d)
+        hit = cache.get(ckey)
+        if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
+            pois[i]["_wd"]["desc_en_pl"] = hit[1]
+            local_tr[ckey] = hit
+            cache_hits += 1
+        else:
+            todo_wd.append((i, src_d, ckey))
+
+    if cache_hits:
+        log(f"  [Cache tłumaczeń] odzyskano gotowych tłumaczeń (sąsiednie kafle / poprzednia runda): {cache_hits}")
+
+    # Tłumaczenia wyłącznie przez TranslateGemma 4B (Ollama) — bez rang, KAŻDY punkt, z zapisem postępu
     TR_STATS.clear()
     t_tr_start = time.time()
-    ollama_ok = llm_max > 0 and bool(en_queue or other_queue) and ollama_available(llm_url)
-    nllb = NllbTranslator(nllb_dir, log) if (nllb_max > 0 and bool(en_queue or other_queue or osm_tr_queue or wd_en_queue)) else None
-    nllb_ok = bool(nllb and nllb.ok)
+    total_todo = len(todo_wiki) + len(todo_osm) + len(todo_wd)
+    ollama_ok = llm_max > 0 and total_todo > 0 and ollama_available(llm_url)
 
-    if ollama_ok or nllb_ok:
-        wiki_jobs = sorted(
-            [(rank(i), "en", i) for i in en_queue] + [(rank(i), "other", i) for i in other_queue],
-            key=lambda j: j[0],
-        )
-        llm_seconds = float(os.environ.get("LLM_SECONDS_PER_TILE", "720"))
-        t_llm = time.time()
-        llm_tried = 0
-        llm_active = ollama_ok
-        remaining_for_nllb = []
+    if ollama_ok:
+        foreign_long_max = int(os.environ.get("WIKI_FOREIGN_LONG_MAX", "10000"))
+        llm_done = 0
+        since_save = 0
+        consec_err = 0
+        last_save_t = time.time()
+        incomplete = False
+        fgot = 0
 
-        for _, kind, i in wiki_jobs[:max(llm_max, nllb_max)]:
-            lang = "en" if kind == "en" else other_title[i][0]
-            src_txt = en_txt[en_title[i]] if kind == "en" else other_txt[other_title[i]]
-            if llm_active:
-                if time.time() - t_llm > llm_seconds or llm_tried >= llm_max:
-                    llm_active = False
-                elif llm_tried >= 3 and TR_STATS.get("llm:udane", 0) == 0 and \
-                        sum(v for k, v in TR_STATS.items() if k.startswith("llm:błąd")) == llm_tried:
-                    log("  ⚠️ Ollama nie odpowiada - przełączam pozostałe tłumaczenia na NLLB-200")
-                    llm_active = False
-            if llm_active:
-                llm_tried += 1
-                tr = translate_ollama(src_txt, pois[i].get("name"), llm_url, llm_model, lang, "wiki")
-                if tr:
-                    translated[i] = tr
-                    if kind == "other":
-                        pois[i]["_tr_lang"] = lang
+        def checkpoint(force_save=False):
+            nonlocal since_save, last_save_t
+            if save_cache and local_tr and (force_save or since_save >= 20 or (time.time() - last_save_t) >= 600):
+                save_cache(local_tr)
+                since_save = 0
+                last_save_t = time.time()
+
+        # 1. Wszystkie obcojęzyczne artykuły Wikipedii (każdy do 10 zdań pod "Czytaj więcej")
+        for idx_w, (kind, i, lang, title, wkey, wdkey) in enumerate(todo_wiki):
+            if llm_done >= llm_max:
+                break
+            # Jeśli inny POI w tym samym kaflu już przetłumaczył ten sam artykuł chwilę temu — użyj od razu!
+            hit = cache.get(wkey) or (cache.get(wdkey) if wdkey else None)
+            if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
+                translated[i] = hit[1]
+                if hit[0] and hit[0] != "en":
+                    pois[i]["_tr_lang"] = hit[0]
+                continue
+            if deadline_ts and time.time() >= deadline_ts:
+                incomplete = True
+                log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({idx_w}/{len(todo_wiki)} artykułów Wikipedii); dokończy kolejna runda")
+                break
+            src_txt = en_txt[title] if kind == "en" else other_txt[(lang, title)]
+            # Dobierz do 10 zdań tuż przed tłumaczeniem (tylko dla jeszcze nieprzetłumaczonego artykułu)
+            if wiki and fgot < foreign_long_max and len(_split_sentences(full_sentences(src_txt))) < 4:
+                try:
+                    longer = wiki.article_start(lang, title)
+                    if len(_split_sentences(full_sentences(longer))) > len(_split_sentences(full_sentences(src_txt))):
+                        src_txt = longer
+                        fgot += 1
+                except Exception:
+                    pass
+                time.sleep(0.06)
+            before_err = sum(v for k, v in TR_STATS.items() if k.startswith("llm:błąd"))
+            tr = translate_ollama(src_txt, pois[i].get("name"), llm_url, llm_model, lang, "wiki")
+            after_err = sum(v for k, v in TR_STATS.items() if k.startswith("llm:błąd"))
+            if after_err > before_err:
+                consec_err += 1
+                if consec_err >= 5:
+                    incomplete = True
+                    log("  ⚠️ Ollama przestała odpowiadać (5 błędów pod rząd) — zapisuję postęp, dokończy kolejna runda")
+                    break
+            else:
+                consec_err = 0
+            llm_done += 1
+            if tr:
+                translated[i] = tr
+                if kind == "other":
+                    pois[i]["_tr_lang"] = lang
+                entry = [lang, tr]
+                cache[wkey] = entry
+                local_tr[wkey] = entry
+                if wdkey:
+                    cache[wdkey] = entry
+                    local_tr[wdkey] = entry
+                since_save += 1
+                checkpoint()
+
+        # 2. Obcojęzyczne opisy z OSM (krótkie)
+        if not incomplete:
+            for idx_o, (i, dlang, src_d, ckey) in enumerate(todo_osm):
+                if llm_done >= llm_max:
+                    break
+                if ckey in cache:
+                    pois[i]["_desc_translated"] = cache[ckey][1]
                     continue
-            remaining_for_nllb.append((kind, i, lang, src_txt))
-
-        # Szybkie uzupełnienie NLLB-200: pozostałe artykuły Wikipedii + opisy OSM + krótkie opisy Wikidata (desc_en)
-        if nllb_ok:
-            # Najpierw zwolnij RAM z modelu Ollamy przed uruchomieniem NLLB i GraphHoppera
-            if ollama_ok:
-                ollama_unload(llm_url, llm_model)
-            nllb_done = 0
-            nllb_seconds = float(os.environ.get("NLLB_SECONDS_PER_TILE", "420"))
-            t_nllb = time.time()
-            for kind, i, lang, src_txt in remaining_for_nllb:
-                if nllb_done >= nllb_max or (time.time() - t_nllb) > nllb_seconds:
+                if deadline_ts and time.time() >= deadline_ts:
+                    incomplete = True
+                    log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({idx_o}/{len(todo_osm)} opisów OSM); dokończy kolejna runda")
                     break
-                tr = nllb.translate(src_txt, lang, max_sentences=10)
-                nllb_done += 1
-                if tr:
-                    translated[i] = tr
-                    if kind == "other":
-                        pois[i]["_tr_lang"] = lang
-            for i in osm_tr_queue[:100]:
-                if (time.time() - t_nllb) > nllb_seconds:
-                    break
-                t = pois[i].get("tags") or {}
-                src_d = t.get("description:en") or t.get("description")
-                dlang = "en" if (t.get("description:en") or looks_english(src_d)) else "de"
-                tr = nllb.translate(src_d, dlang, max_sentences=4)
+                tr = translate_ollama(src_d, pois[i].get("name"), llm_url, llm_model, dlang, "osm", min_len=12)
+                llm_done += 1
                 if tr:
                     pois[i]["_desc_translated"] = tr
-            for i in wd_en_queue[:300]:
-                if (time.time() - t_nllb) > nllb_seconds:
+                    entry = [dlang, tr]
+                    cache[ckey] = entry
+                    local_tr[ckey] = entry
+                    since_save += 1
+                    checkpoint()
+
+        # 3. Krótkie angielskie opisy z Wikidata (desc_en) — dają konkretny kontekst punktom bez Wikipedii
+        if not incomplete:
+            for idx_d, (i, src_d, ckey) in enumerate(todo_wd):
+                if llm_done >= llm_max:
                     break
-                tr = nllb.translate(pois[i]["_wd"]["desc_en"], "en", max_sentences=2, min_len=8)
+                if ckey in cache:
+                    pois[i]["_wd"]["desc_en_pl"] = cache[ckey][1]
+                    continue
+                if deadline_ts and time.time() >= deadline_ts:
+                    incomplete = True
+                    log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({idx_d}/{len(todo_wd)} opisów Wikidata); dokończy kolejna runda")
+                    break
+                tr = translate_ollama(src_d, pois[i].get("name"), llm_url, llm_model, "en", "osm", min_len=8)
+                llm_done += 1
                 if tr:
                     pois[i]["_wd"]["desc_en_pl"] = tr
-            nllb.close()
-            del nllb
-            gc.collect()
-        elif ollama_ok:
-            # Jeśli brak NLLB, przetłumacz jeszcze wybrane opisy OSM przez Ollamę jeśli został czas, potem zwolnij RAM
-            for i in osm_tr_queue[:20]:
-                if time.time() - t_llm > llm_seconds:
-                    break
-                t = pois[i].get("tags") or {}
-                src_d = t.get("description:en") or t.get("description")
-                tr = translate_ollama(src_d, pois[i].get("name"), llm_url, llm_model, "en", "osm")
-                if tr:
-                    pois[i]["_desc_translated"] = tr
-            ollama_unload(llm_url, llm_model)
+                    entry = ["en", tr]
+                    cache[ckey] = entry
+                    local_tr[ckey] = entry
+                    since_save += 1
+                    checkpoint()
 
-        log(f"  [Tłumaczenia] kandydatów: {len(en_queue)} EN + {len(other_queue)} inne + {len(osm_tr_queue)} OSM + {len(wd_en_queue)} Wikidata EN"
-            f" | wynik: {TR_STATS or 'brak prób'} | {time.time() - t_tr_start:.0f} s")
-    elif llm_max > 0 and (en_queue or other_queue):
-        log(f"  ⚠️ Brak dostępnego tłumacza (Ollama: {llm_url}, NLLB: {nllb_dir}) - {len(en_queue) + len(other_queue)} artykułów bez tłumaczenia")
+        ollama_unload(llm_url, llm_model)
+        checkpoint(force_save=True)
+        log(f"  [Tłumaczenia TranslateGemma] do przetłumaczenia: {len(todo_wiki)} Wiki + {len(todo_osm)} OSM + {len(todo_wd)} Wikidata "
+            f"| z cache: {cache_hits} | rozszerzonych do 10 zdań: {fgot} | wynik: {TR_STATS or 'brak prób'} | {time.time() - t_tr_start:.0f} s")
+        if incomplete:
+            stats["incomplete"] = True
+            return stats
+    else:
+        if save_cache and local_tr:
+            save_cache(local_tr)
+        if llm_max > 0 and total_todo > 0:
+            log(f"  ⚠️ Model TranslateGemma niedostępny ({llm_url}) - {total_todo} opisów bez tłumaczenia")
 
     for i, p in enumerate(pois):
         desc, src = None, None
