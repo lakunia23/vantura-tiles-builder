@@ -38,6 +38,7 @@ import gc
 import gzip
 import math
 import json
+import random
 import time
 import shutil
 import sqlite3
@@ -96,6 +97,13 @@ OSMCONVERT_HASH_MB = int(os.environ.get("OSMCONVERT_HASH_MB", "1000"))
 BLOCK = int(os.environ.get("BLOCK", "3"))            # bok bloku kafli jednego zadania (3 -> do 9 kafli)
 BATCH = int(os.environ.get("BATCH", "1"))            # numer partii (budowa świata w częściach)
 BATCH_BLOCKS = int(os.environ.get("BATCH_BLOCKS", "250"))  # bloków na partię (limit GitHub: 256 zadań)
+SKIP_EXISTING = os.environ.get("SKIP_EXISTING", "0") == "1"
+SHARD_ENABLE = os.environ.get("SHARD_ENABLE", "1") == "1"
+SHARD_THRESHOLD = int(os.environ.get("SHARD_THRESHOLD", "6"))
+SHARD_MAX = int(os.environ.get("SHARD_MAX", "12"))
+SHARD_INDEX = int(os.environ.get("SHARD_INDEX", "0"))
+SHARD_TOTAL = int(os.environ.get("SHARD_TOTAL", "1"))
+TRANSLATE_ONLY = os.environ.get("TRANSLATE_ONLY", "0") == "1"
 EVICT_LOCK = threading.Lock()
 PROTECTED = set()  # nazwy plików kafli, których nie wolno usuwać (kraje przypięte)
 CLIP_LOCK = threading.Lock()
@@ -113,6 +121,7 @@ os.environ["_JAVA_OPTIONS"] = "-Djava.io.tmpdir=" + TEMP_DIR.replace("\\", "/")
 
 PROCESSED_LOG = os.path.join(WORK_DIR, "processed_tiles_v2.txt")
 FAILED_LOG = os.path.join(WORK_DIR, "failed_tiles_v2.txt")
+PAUSED_LOG = os.path.join(WORK_DIR, "paused_tiles_v2.txt")
 BUILDER_LOG = os.path.join(WORK_DIR, "builder_v2.log")
 STATUS_FILE = os.path.join(WORK_DIR, "current_status.json")
 
@@ -399,17 +408,72 @@ def _gh(args, check=True):
     return subprocess.run(["gh"] + args + ["--repo", GITHUB_REPOSITORY], capture_output=True, text=True, check=check)
 
 
-def github_assets(tag):
+def github_assets(tag, refresh=False):
     with _GH_LOCK:
-        if tag not in _RELEASE_ASSETS:
+        if refresh or tag not in _RELEASE_ASSETS:
             res = _gh(["release", "view", tag, "--json", "assets", "-q", ".assets[].name"], check=False)
             _RELEASE_ASSETS[tag] = set(res.stdout.split()) if res.returncode == 0 else set()
         return _RELEASE_ASSETS[tag]
 
 
+def list_all_github_assets():
+    """Szybka lista wszystkich plików ze wszystkich wydań kafle-* w repozytorium (1-3 zapytania API)."""
+    all_assets = set()
+    if not GITHUB_REPOSITORY:
+        return all_assets
+    res = subprocess.run(
+        ["gh", "api", "--paginate", f"repos/{GITHUB_REPOSITORY}/releases?per_page=100"],
+        capture_output=True, text=True, check=False,
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return all_assets
+    try:
+        # gh api --paginate może zwrócić kilka tablic JSON sklejonych po sobie: [...][...]
+        dec = json.JSONDecoder()
+        s = res.stdout.strip()
+        pos = 0
+        rels = []
+        while pos < len(s):
+            while pos < len(s) and s[pos].isspace():
+                pos += 1
+            if pos >= len(s):
+                break
+            chunk, end = dec.raw_decode(s, pos)
+            if isinstance(chunk, list):
+                rels.extend(chunk)
+            pos = end
+    except Exception:
+        return all_assets
+    for r in rels:
+        tag = r.get("tag_name") or ""
+        if not tag.startswith("kafle-"):
+            continue
+        names = {a.get("name") for a in (r.get("assets") or []) if a.get("name")}
+        if len(names) >= 95 and r.get("id"):
+            r2 = subprocess.run(
+                ["gh", "api", "--paginate", f"repos/{GITHUB_REPOSITORY}/releases/{r['id']}/assets?per_page=100", "-q", ".[].name"],
+                capture_output=True, text=True, check=False,
+            )
+            if r2.returncode == 0 and r2.stdout.strip():
+                names |= set(r2.stdout.split())
+        with _GH_LOCK:
+            _RELEASE_ASSETS[tag] = names
+        all_assets |= names
+    return all_assets
+
+
+def github_delete_asset(tag, name):
+    res = _gh(["release", "delete-asset", tag, name, "--yes"], check=False)
+    if res.returncode == 0:
+        with _GH_LOCK:
+            if tag in _RELEASE_ASSETS:
+                _RELEASE_ASSETS[tag].discard(name)
+    return res.returncode == 0
+
+
 def github_upload(path, name, lat, lon):
     tag = release_tag(lat, lon)
-    for attempt in range(1, 6):
+    for attempt in range(1, 7):
         try:
             with _GH_LOCK:
                 if _gh(["release", "view", tag], check=False).returncode != 0:
@@ -425,7 +489,7 @@ def github_upload(path, name, lat, lon):
             log(f"  ⚠️ Wysyłka do wydania {tag} (próba {attempt}): {res.stderr.strip()[:200]}")
         except Exception as e:
             log(f"  ⚠️ Wysyłka do wydania {tag} (próba {attempt}): {e}")
-        time.sleep(10 * attempt)
+        time.sleep(8 * attempt + random.uniform(0.5, 3.5))
     return False
 
 
@@ -461,17 +525,42 @@ def tile_already_exists(lat, lon):
     return (name in github_assets(release_tag(lat, lon))) if UPLOAD_TARGET == "github" else tile_exists_in_r2(name)
 
 
-def tr_cache_name(tile_id):
+def tr_cache_name(tile_id, shard_index=None):
+    if shard_index is not None:
+        return f"tr_{tile_id}_{LANG}.s{int(shard_index):02d}.json.gz"
     return f"tr_{tile_id}_{LANG}.json.gz"
 
 
-def load_tr_cache(lat, lon):
-    """Pobiera pamięć tłumaczeń (własną z poprzedniej rundy + z 8 sąsiednich kafli),
+def _download_gh_json_gz(tag, cname):
+    tmp = os.path.join(TEMP_DIR, f"dl_{cname}")
+    try:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        res = _gh(["release", "download", tag, "-p", cname, "-O", tmp], check=False)
+        if res.returncode == 0 and os.path.exists(tmp):
+            with gzip.open(tmp, "rt", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+    return {}
+
+
+def load_tr_cache(lat, lon, include_shards=True):
+    """Pobiera pamięć tłumaczeń (własną z poprzedniej rundy + shardy .sXX + z 8 sąsiednich kafli),
     aby wznawiać gęste kafle i nie tłumaczyć tych samych obiektów w zakładkach."""
     merged = {}
+    shard_files = []
     if DRY_RUN:
-        return merged
-    # najpierw sąsiedzi, na końcu własny kafel (ma pierwszeństwo)
+        return merged, shard_files
+    # najpierw sąsiedzi, na końcu własny kafel i jego shardy (mają pierwszeństwo)
     offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if not (dy == 0 and dx == 0)] + [(0, 0)]
     for dy, dx in offsets:
         la, lo = lat + dy, lon + dx
@@ -481,26 +570,17 @@ def load_tr_cache(lat, lon):
         cname = tr_cache_name(tid)
         if UPLOAD_TARGET == "github":
             tag = release_tag(la, lo)
-            if cname not in github_assets(tag):
-                continue
-            tmp = os.path.join(TEMP_DIR, f"dl_{cname}")
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-                res = _gh(["release", "download", tag, "-p", cname, "-O", tmp], check=False)
-                if res.returncode == 0 and os.path.exists(tmp):
-                    with gzip.open(tmp, "rt", encoding="utf-8") as f:
-                        d = json.load(f)
-                    if isinstance(d, dict):
-                        merged.update(d)
-            except Exception:
-                pass
-            finally:
-                try:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
-                except Exception:
-                    pass
+            assets = github_assets(tag, refresh=(dy == 0 and dx == 0))
+            if cname in assets:
+                merged.update(_download_gh_json_gz(tag, cname))
+            if include_shards and dy == 0 and dx == 0:
+                prefix = f"tr_{tid}_{LANG}.s"
+                for aname in sorted(assets):
+                    if aname.startswith(prefix) and aname.endswith(".json.gz"):
+                        d = _download_gh_json_gz(tag, aname)
+                        if d:
+                            merged.update(d)
+                        shard_files.append(aname)
         else:
             local_p = os.path.join(WORK_DIR, cname)
             if os.path.exists(local_p):
@@ -511,21 +591,31 @@ def load_tr_cache(lat, lon):
                         merged.update(d)
                 except Exception:
                     pass
-    return merged
+    return merged, shard_files
 
 
-def save_tr_cache(lat, lon, tile_id, tr_dict):
+def save_tr_cache(lat, lon, tile_id, tr_dict, shard_index=None):
     if DRY_RUN or not tr_dict:
-        return
-    cname = tr_cache_name(tile_id)
+        return False
+    cname = tr_cache_name(tile_id, shard_index=shard_index)
     tmp = os.path.join(WORK_DIR, cname)
     try:
         with gzip.open(tmp, "wt", encoding="utf-8") as f:
             json.dump(tr_dict, f, ensure_ascii=False)
         if UPLOAD_TARGET == "github":
-            github_upload(tmp, cname, lat, lon)
+            return github_upload(tmp, cname, lat, lon)
+        return True
     except Exception as e:
         log(f"  ⚠️ Nie udało się zapisać pamięci tłumaczeń {cname}: {e}")
+        return False
+
+
+def cleanup_shard_caches(lat, lon, shard_files):
+    if DRY_RUN or UPLOAD_TARGET != "github" or not shard_files:
+        return
+    tag = release_tag(lat, lon)
+    for sf in shard_files:
+        github_delete_asset(tag, sf)
 
 
 # ------------------------------------------------------------------ budowa jednego kafla
@@ -589,25 +679,48 @@ def build_tile(lat, lon, sources, force):
         if poi_count == 0 and osm_size < 100 * 1024:
             log(f"  🌊 {tile_id}: morze/pustkowie (0 POI, {osm_size} B) - pomijam")
             return True
-        # Opisy: Wikipedia PL -> obcojęzyczna Wikipedia/OSM/Wikidata (wyłącznie TranslateGemma 4B, każdy punkt,
-        # bez rang, ze wznawianą pamięcią tłumaczeń tr_<KAFEL>_pl.json.gz współdzieloną z sąsiadami).
+        # Opisy: Wikipedia PL -> obcojęzyczna Wikipedia/OSM/Wikidata (priorytet Gemini API, potem TranslateGemma 4B,
+        # do 5 zdań, z pamięcią tłumaczeń tr_<KAFEL>_pl.json.gz współdzieloną z sąsiadami i dzieloną na shardy).
         tr_max_s = int(os.environ.get("TRANSLATE_MAX_S", "0"))
         deadline_ts = (START_TIME + tr_max_s) if tr_max_s > 0 else None
-        tr_cache = load_tr_cache(lat, lon)
+        tr_cache, shard_files = load_tr_cache(lat, lon, include_shards=(not TRANSLATE_ONLY))
         if tr_cache:
-            log(f"  [Cache tłumaczeń] wczytano {len(tr_cache)} wpisów (własny / sąsiednie kafle)")
+            sh_msg = f" (w tym {len(shard_files)} plików z równoległych maszyn)" if shard_files else ""
+            log(f"  [Cache tłumaczeń] wczytano {len(tr_cache)} wpisów{sh_msg}")
+
+        merged_saved = {"ok": False}
+
+        def _save_cache_cb(d):
+            if TRANSLATE_ONLY and SHARD_TOTAL > 1:
+                save_tr_cache(lat, lon, tile_id, d, shard_index=SHARD_INDEX)
+            else:
+                if save_tr_cache(lat, lon, tile_id, d):
+                    merged_saved["ok"] = True
+
         enrich_stats = enrich_descriptions(
             scanner.pois, log,
             places=scanner.places,
             geo_wiki=scanner.geo_wiki,
             protected_areas=scanner.protected_areas,
             tr_cache=tr_cache,
-            save_cache=lambda d: save_tr_cache(lat, lon, tile_id, d),
+            save_cache=_save_cache_cb,
             deadline_ts=deadline_ts,
+            shard_index=SHARD_INDEX if TRANSLATE_ONLY else 0,
+            shard_total=SHARD_TOTAL if TRANSLATE_ONLY else 1,
+            translate_only=TRANSLATE_ONLY,
         )
+        if not TRANSLATE_ONLY and shard_files and merged_saved["ok"]:
+            cleanup_shard_caches(lat, lon, shard_files)
+            log(f"  [Cache tłumaczeń] scalono i posprzątano {len(shard_files)} tymczasowych plików shardów")
+        if TRANSLATE_ONLY:
+            if enrich_stats.get("incomplete"):
+                log(f"  ⏸️ {tile_id} [shard {SHARD_INDEX + 1}/{SHARD_TOTAL}]: limit czasu — postęp zapisany w {tr_cache_name(tile_id, SHARD_INDEX if SHARD_TOTAL > 1 else None)}")
+                return "paused"
+            log(f"  ✓ {tile_id} [shard {SHARD_INDEX + 1}/{SHARD_TOTAL}]: tłumaczenia gotowe")
+            return True
         if enrich_stats.get("incomplete"):
-            log(f"  ⏸️ {tile_id}: tłumaczenia w toku (postęp zapisany w {tr_cache_name(tile_id)}) — kolejna runda dokończy resztę")
-            return False
+            log(f"  ⏸️ {tile_id}: tłumaczenia w toku (postęp zapisany w {tr_cache_name(tile_id)}) — kolejna runda dokończy automatycznie")
+            return "paused"
         conn = sqlite3.connect(poi_db)
         cur = conn.cursor()
         cur.execute("""CREATE TABLE IF NOT EXISTS pois (
@@ -828,12 +941,16 @@ def main():
         return
     order = [cid for cid in PRIORITY if cid in by_id] + [c["id"] for c in catalog if c["id"] not in PRIORITY]
     if "--list-tiles" in sys.argv:
-        # Lista kafli krajów przypiętych (dla równoległych zadań GitHub Actions)
-        # Bloki BLOCK x BLOCK sąsiednich kafli: jedno zadanie pobiera wspólne regiony raz.
-        # "world" = wszystkie kraje (najpierw lista PRIORITY: Polska i sąsiedzi), w partiach po BATCH_BLOCKS.
+        # Lista kafli krajów przypiętych (dla równoległych zadań GitHub Actions).
+        # Bloki BLOCK x BLOCK sąsiednich kafli ułożone szachownicowo (mniejsze dublowanie tłumaczeń w zakładkach).
+        # Przy SKIP_EXISTING=1 pomija kafle już wgrane do GitHub Releases i automatycznie włącza tryb "sharded"
+        # (wiele maszyn na 1 kafel), gdy w bieżącej partii zostało <= SHARD_THRESHOLD kafli (np. Liechtenstein!).
         ids = PIN_COUNTRIES or ONLY_COUNTRIES
         if ids == ["world"]:
             ids = [c for c in order]
+        existing = set()
+        if SKIP_EXISTING and UPLOAD_TARGET == "github" and GITHUB_REPOSITORY:
+            existing = list_all_github_assets()
         seen, blocks, block_order = set(), {}, []
         for cid in ids:
             for la, lo in sorted(country_tiles(by_id[cid])):
@@ -845,10 +962,91 @@ def main():
                     blocks[key] = []
                     block_order.append(key)
                 blocks[key].append(format_tile_id(la, lo))
-        total = (len(block_order) + BATCH_BLOCKS - 1) // BATCH_BLOCKS
-        part = block_order[(BATCH - 1) * BATCH_BLOCKS: BATCH * BATCH_BLOCKS]
+
+        total = max(1, (len(block_order) + BATCH_BLOCKS - 1) // BATCH_BLOCKS)
+
+        def _unbuilt_blocks(batch_num):
+            raw_keys = block_order[(batch_num - 1) * BATCH_BLOCKS: batch_num * BATCH_BLOCKS]
+            # Szachownica w obrębie partii: najpierw nie-sąsiadujące bloki, aby sąsiedzi korzystali z cache tłumaczeń
+            raw_keys = sorted(raw_keys, key=lambda k: ((k[0] % 2) * 2 + (k[1] % 2)))
+            out_b = []
+            for k in raw_keys:
+                rem = [tid for tid in blocks[k] if archive_name(tid) not in existing]
+                if rem:
+                    out_b.append(rem)
+            return out_b
+
+        chosen_batch = None
+        chosen_blocks = []
+        for bnum in range(max(1, BATCH), total + 1):
+            ub = _unbuilt_blocks(bnum)
+            if ub:
+                chosen_batch = bnum
+                chosen_blocks = ub
+                break
+
+        has_more_batches = False
+        if chosen_batch is not None:
+            for bnum in range(chosen_batch + 1, total + 1):
+                if _unbuilt_blocks(bnum):
+                    has_more_batches = True
+                    break
+        else:
+            # Sprawdź wcześniejsze partie (gdyby jakieś gęste kafle wymagały kolejnej rundy)
+            earlier_has_work = any(_unbuilt_blocks(bnum) for bnum in range(1, min(BATCH, total + 1)))
+            if earlier_has_work:
+                print(f"PARTIE={total} KAFLE={len(seen)} BLOKI={len(block_order)}")
+                print("DONE=0")
+                print("MODE=wrap")
+                print("NEXT_BATCH=0")
+                print("HAS_MORE_BATCHES=0")
+                print("REMAINING=1")
+                print("GEMINI_WORKERS=1")
+                print("CHECK_TILES=")
+                print('SHARDS={"include": []}')
+                print('{"include": []}')
+                return
+            print(f"PARTIE={total} KAFLE={len(seen)} BLOKI={len(block_order)}")
+            print("DONE=1")
+            print("MODE=done")
+            print(f"NEXT_BATCH={total}")
+            print("HAS_MORE_BATCHES=0")
+            print("REMAINING=0")
+            print("GEMINI_WORKERS=1")
+            print("CHECK_TILES=")
+            print('SHARDS={"include": []}')
+            print('{"include": []}')
+            return
+
+        batch_tiles = [tid for blk in chosen_blocks for tid in blk]
+        if SHARD_ENABLE and 1 <= len(batch_tiles) <= SHARD_THRESHOLD:
+            mode = "sharded"
+            per_tile = min(SHARD_MAX, max(2, 12 // len(batch_tiles)))
+            shards_mat = {
+                "include": [
+                    {"tile": tid, "shard_index": s, "shard_total": per_tile}
+                    for tid in batch_tiles for s in range(per_tile)
+                ]
+            }
+            bloki_mat = {"include": [{"tiles": tid} for tid in batch_tiles]}
+            gem_workers = min(18, len(shards_mat["include"]))
+        else:
+            mode = "normal"
+            shards_mat = {"include": []}
+            bloki_mat = {"include": [{"tiles": ",".join(blk)} for blk in chosen_blocks]}
+            gem_workers = min(18, max(1, len(bloki_mat["include"])))
+
+        check_tiles = ",".join(batch_tiles) if (not has_more_batches and len(batch_tiles) <= 20) else ""
         print(f"PARTIE={total} KAFLE={len(seen)} BLOKI={len(block_order)}")
-        print(json.dumps({"include": [{"tiles": ",".join(blocks[k])} for k in part]}))
+        print("DONE=0")
+        print(f"MODE={mode}")
+        print(f"NEXT_BATCH={chosen_batch}")
+        print(f"HAS_MORE_BATCHES={1 if has_more_batches else 0}")
+        print(f"REMAINING={len(batch_tiles)}")
+        print(f"GEMINI_WORKERS={gem_workers}")
+        print(f"CHECK_TILES={check_tiles}")
+        print("SHARDS=" + json.dumps(shards_mat))
+        print(json.dumps(bloki_mat))
         return
     if ONLY_COUNTRIES:
         unknown = [c for c in ONLY_COUNTRIES if c not in by_id]
@@ -880,24 +1078,28 @@ def main():
     in_flight = {}   # tile_id -> (future, zbiór id krajów-źródeł)
 
     def run_tile(la, lo, tile_id, sources):
-        ok = False
+        res = False
         tr_max_s = int(os.environ.get("TRANSLATE_MAX_S", "0"))
         for attempt in range(1, 4):
-            ok = build_tile(la, lo, sources, force)
-            if ok:
+            res = build_tile(la, lo, sources, force)
+            if res is True or res == "paused":
                 break
             if (tr_max_s and time.time() >= START_TIME + tr_max_s) or (MAX_RUNTIME_S and time.time() - START_TIME > MAX_RUNTIME_S):
                 log(f"  ⏸️ {tile_id}: zatrzymano z powodu limitu czasu zadania — dokończy kolejna runda")
+                res = "paused"
                 break
             log(f"  ❌ {tile_id} próba {attempt}/3 nieudana")
             time.sleep(10)
         with lock:
-            if not ok:
+            if res == "paused":
+                with open(PAUSED_LOG, "a", encoding="utf-8") as f:
+                    f.write(tile_id + "\n")
+            elif res is not True:
                 with open(FAILED_LOG, "a", encoding="utf-8") as f:
                     f.write(tile_id + "\n")
             with open(PROCESSED_LOG, "a", encoding="utf-8") as f:
                 f.write(tile_id + "\n")
-        return ok
+        return res is True
 
     def wait_for_slot(limit):
         while True:

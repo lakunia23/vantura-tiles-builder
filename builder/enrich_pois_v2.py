@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VANTURA - OPISY ATRAKCJI v2.2 (etap budowy kafla)
+VANTURA - OPISY ATRAKCJI v2.3 (etap budowy kafla)
 
-Zasada: opis ma być PRAWDZIWY, ciekawy i po polsku (nazwy własne bez zmian).
-Aplikacja wyświetla średnio do 3 zdań podsumowania, a gdy opis ma więcej niż 3 zdania -
-przycisk "Czytaj więcej" rozwija pełny, szczegółowy opis (do 10 zdań).
+Zasada: opis ma być PRAWDZIWY, dokładny, ciekawy i po polsku (nazwy własne bez zmian).
+Aplikacja wyświetla średnio do 3 zdań podsumowania, a przycisk "Czytaj więcej" rozwija
+pełny opis (polska Wikipedia do 10 zdań, tłumaczenia obcojęzyczne do 5 zdań).
 
 Źródła faktów, bez rang i bez ucinania punktów:
   1. Polska Wikipedia (do 10 zdań) - przez tag wikidata/wikipedia z OSM, relacje multipolygon,
      dziedziczenie z sąsiedniego budynku (<= 60 m) oraz bezpieczny GeoSearch (współrzędne + nazwa).
-  2. Obcojęzyczna Wikipedia (EN + ponad 40 języków, do 10 zdań), obcojęzyczne opisy OSM oraz
-     krótkie opisy Wikidata (desc_en) - tłumaczone dla KAŻDEGO punktu wyłącznie przez TranslateGemma 4B
-     (Ollama) z zachowaniem nazw własnych, kontrolą liczb oraz wznawialną pamięcią tłumaczeń
-     (tr_<KAFEL>_pl.json.gz współdzieloną z sąsiednimi kaflami i wznawianą między rundami).
+  2. Obcojęzyczna Wikipedia (EN + ponad 40 języków, do 5 zdań), obcojęzyczne opisy OSM oraz
+     informacyjne opisy Wikidata (desc_en):
+       - priorytetowo przez darmowe API Google Gemini (w paczkach po kilkanaście opisów naraz),
+       - po wyczerpaniu dziennego limitu API: automatyczne, płynne przełączenie na lokalny
+         TranslateGemma 4B (Ollama), z okresowym sprawdzaniem wznowienia limitu Gemini,
+       - z zachowaniem nazw własnych, ścisłą kontrolą liczb oraz wznawialną pamięcią tłumaczeń
+         (tr_<KAFEL>_pl.json.gz współdzieloną z sąsiednimi kaflami i dzieloną na wiele maszyn).
   3. Bogate dane OpenStreetMap + Wikidata (styl architektoniczny, status UNESCO, pasmo górskie,
      park narodowy/rezerwat, typ zamku/muzeum, materiał, architekt/twórca, kierunek panoramy,
      długość jaskini, wybitność szczytu, godziny otwarcia, wstęp, inskrypcje).
 Bez zdjęć (image_url = NULL) - aplikacja pobiera zdjęcie sama przy otwarciu atrakcji.
 """
+import datetime
 import gc
 import gzip
 import hashlib
 import json
 import math
 import os
+import random
 import re
 import time
 import unicodedata
@@ -925,12 +930,12 @@ class Wiki:
             time.sleep(0.15)
         return out
 
-    def article_start(self, lang, title):
-        """Początek całego artykułu (do 10 zdań, także spoza wstępu) - na 'Czytaj więcej'.
+    def article_start(self, lang, title, max_sentences=10):
+        """Początek całego artykułu (do max_sentences zdań, także spoza wstępu) - na 'Czytaj więcej'.
         WAŻNE: exsectionformat='wiki' zwraca nagłówki '== Tytuł ==' (a NIE śmieci U+FFFD z 'raw')."""
         data = self._get(f"https://{lang}.wikipedia.org/w/api.php", {
-            "action": "query", "prop": "extracts", "exsentences": "10", "explaintext": "1",
-            "exsectionformat": "wiki", "redirects": "1", "titles": title,
+            "action": "query", "prop": "extracts", "exsentences": str(max(1, min(10, int(max_sentences)))),
+            "explaintext": "1", "exsectionformat": "wiki", "redirects": "1", "titles": title,
         })
         for page in ((data.get("query") or {}).get("pages") or {}).values():
             txt = page.get("extract") or ""
@@ -1196,11 +1201,348 @@ def numbers_ok(source, translated):
     return True
 
 
+TR_MAX_SENTENCES = int(os.environ.get("TR_MAX_SENTENCES", "5"))
+TR_MAX_CHARS = int(os.environ.get("TR_MAX_CHARS", "1050"))
+
 TR_STATS = {}
 
 
-def _tr_stat(key):
-    TR_STATS[key] = TR_STATS.get(key, 0) + 1
+def _tr_stat(key, delta=1):
+    TR_STATS[key] = TR_STATS.get(key, 0) + delta
+
+
+def _pacific_day():
+    """Zwraca przybliżoną datę w czasie pacyficznym (UTC-8), kiedy Google AI Studio resetuje dzienne limity."""
+    return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=8)).date()
+
+
+_TRIVIAL_WD_RE = re.compile(
+    r"^(?:a |an |the )?"
+    r"(?:mountain|peak|hill|summit|ridge|pass|glacier|waterfall|cave|spring|rock|cliff|gorge|lake|park|garden|forest|wood|nature reserve|protected area|"
+    r"castle|palace|ruins?|fort|fortress|manor|monument|memorial|statue|sculpture|artwork|mural|museum|art museum|gallery|theatre|theater|tower|observation tower|"
+    r"viewpoint|church|chapel|cathedral|monastery|synagogue|building|historic building|heritage site|square|plaza|city gate|mine|archaeological site|bunker)"
+    r"(?:\s+(?:in|of|near|at)\s+[\w\s,.'’\-()]{2,45})?\.?$",
+    re.I,
+)
+
+
+def _is_trivial_wd_desc(desc):
+    """Pomija puste meta-opisy Wikidata i banalne 3-wyrazowe etykiety typu 'mountain in Switzerland',
+    które describe_from_osm generuje po polsku bogaciej i bez wywoływania AI."""
+    d = (desc or "").strip()
+    if len(d) < 10:
+        return True
+    dl = d.lower()
+    if any(b in dl for b in ("wikimedia", "disambiguation", "category in", "list of ", "template")):
+        return True
+    if len(d) <= 55 and _TRIVIAL_WD_RE.match(d):
+        return True
+    return False
+
+
+def _extract_json_object(raw):
+    """Wyciąga obiekt JSON z odpowiedzi modelu (także gdy model owinie go w ```json ... ```)."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", s)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+    return None
+
+
+class GeminiTranslator:
+    """Darmowe tłumaczenie w paczkach przez Google AI Studio (Gemini API).
+    - Dynamicznie wykrywa dostępne modele Flash-Lite / Flash / Gemma dla danego klucza.
+    - Rozróżnia chwilowy limit RPM (krótka pauza) od dziennego limitu RPD (cooldown 30 min).
+    - Po upływie cooldownu lub po północy czasu pacyficznego (reset limitów) automatycznie wznawia Gemini."""
+
+    API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+    _SKIP_SUB = (
+        "embedding", "imagen", "veo", "tts", "audio", "image", "robotics", "computer-use",
+        "deep-research", "aqa", "bisection", "live", "native-audio", "vision", "learnlm",
+        "gemini-1.0", "gemini-1.5",
+    )
+
+    def __init__(self, log=print, parallel_workers=1, worker_slot=0):
+        self.log = log
+        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self.enabled = bool(self.api_key)
+        self.cooldown_s = int(os.environ.get("GEMINI_COOLDOWN_S", "1800"))
+        self.parallel_workers = max(1, int(parallel_workers))
+        # Bezpieczne tempo dla darmowego planu (~9 RPM globalnie na 1 klucz)
+        base_rpm = float(os.environ.get("GEMINI_TARGET_RPM", "9.0"))
+        self.min_interval_s = max(5.5, (60.0 / max(1.0, base_rpm)) * self.parallel_workers)
+        self.models = []
+        self.cooldown_until = {}   # model -> (ts, pacific_day)
+        self.disabled_models = set()
+        self.model_flags = {}      # model -> set("no_json", "no_thinking")
+        self._next_call_ts = time.time() + (worker_slot % self.parallel_workers) * (60.0 / max(1.0, base_rpm)) if self.parallel_workers > 1 else 0.0
+        self._logged_cooldown = False
+        if self.enabled:
+            self._init_models()
+
+    def _model_rank(self, name):
+        n = name.lower()
+        if "flash-lite" in n and "preview" not in n:
+            tier = 10
+        elif "flash-lite" in n:
+            tier = 15
+        elif "flash" in n and "preview" not in n and "thinking" not in n:
+            tier = 20
+        elif "flash" in n:
+            tier = 25
+        elif "gemma-3-27b" in n:
+            tier = 30
+        elif "gemma-3-12b" in n:
+            tier = 35
+        elif "gemma" in n:
+            tier = 40
+        else:
+            tier = 90
+        # Preferuj nowsze wersje numeryczne (np. 3.5 > 3.1 > 2.5 > 2.0)
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        ver = -float(m.group(1)) if m else 0.0
+        return (tier, ver, n)
+
+    def _init_models(self):
+        override = [x.strip() for x in os.environ.get("GEMINI_MODEL", "").split(",") if x.strip()]
+        if override:
+            self.models = override
+            self.log(f"  [Gemini] wybrane modele (GEMINI_MODEL): {self.models}")
+            return
+        try:
+            req = urllib.request.Request(
+                f"{self.API_BASE}/models?pageSize=100",
+                headers={"x-goog-api-key": self.api_key, "User-Agent": "VanturaTileBuilder/2.3"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            cands = []
+            for m in data.get("models") or []:
+                methods = m.get("supportedGenerationMethods") or []
+                if "generateContent" not in methods:
+                    continue
+                short = (m.get("name") or "").split("/")[-1]
+                sl = short.lower()
+                if not short or any(bad in sl for bad in self._SKIP_SUB):
+                    continue
+                if "pro" in sl and "flash" not in sl:
+                    continue
+                if not ("flash" in sl or "gemma-3" in sl):
+                    continue
+                cands.append(short)
+            cands = sorted(dict.fromkeys(cands), key=self._model_rank)[:6]
+            if cands:
+                self.models = cands
+                self.log(f"  [Gemini] wykryto dostępne modele: {self.models} (interwał: {self.min_interval_s:.1f}s)")
+                return
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                self.log(f"  ⚠️ [Gemini] klucz API odrzucony (HTTP {e.code}) — używam TranslateGemma 4B")
+                self.enabled = False
+                return
+            self.log(f"  ⚠️ [Gemini] nie udało się pobrać listy modeli (HTTP {e.code}) — używam listy zapasowej")
+        except Exception as e:
+            self.log(f"  ⚠️ [Gemini] błąd wykrywania modeli ({type(e).__name__}) — używam listy zapasowej")
+        self.models = [
+            "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest", "gemini-flash-latest",
+            "gemma-3-27b-it",
+        ]
+
+    def _clear_expired_cooldowns(self):
+        now = time.time()
+        pt_day = _pacific_day()
+        for m in list(self.cooldown_until.keys()):
+            until_ts, cd_day = self.cooldown_until[m]
+            if now >= until_ts or pt_day > cd_day:
+                del self.cooldown_until[m]
+
+    def _active_models(self):
+        if not self.enabled:
+            return []
+        self._clear_expired_cooldowns()
+        return [m for m in self.models if m not in self.disabled_models and m not in self.cooldown_until]
+
+    def any_available(self):
+        avail = bool(self._active_models())
+        if avail and self._logged_cooldown:
+            self.log("  🔄 [Gemini] limit odnowiony / ponowna próba — wracam do tłumaczenia przez Gemini!")
+            self._logged_cooldown = False
+        return avail
+
+    def seconds_until_ready(self):
+        return max(0.0, self._next_call_ts - time.time())
+
+    def ready_now(self):
+        return self.any_available() and time.time() >= self._next_call_ts
+
+    def _mark_cooldown(self, model, seconds=None, reason=""):
+        cd = seconds if seconds is not None else self.cooldown_s
+        self.cooldown_until[model] = (time.time() + cd, _pacific_day())
+        if not self._active_models() and not self._logged_cooldown:
+            self._logged_cooldown = True
+            self.log(f"  ⏳ [Gemini] wyczerpano limit API ({reason or '429'}) — przełączam na TranslateGemma 4B (ponowna próba za {cd // 60} min lub po resecie dobowym)")
+
+    def _call_model(self, model, prompt, expect_json=True):
+        flags = self.model_flags.setdefault(model, set())
+        ml = model.lower()
+        is_gemma = "gemma" in ml
+        gen_cfg = {"temperature": 0.1, "maxOutputTokens": 4096}
+        if expect_json and not is_gemma and "no_json" not in flags:
+            gen_cfg["responseMimeType"] = "application/json"
+        if not is_gemma and "no_thinking" not in flags:
+            if re.search(r"gemini-3", ml):
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": "minimal"}
+            elif "gemini-2.5" in ml:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": gen_cfg,
+        }
+        url = f"{self.API_BASE}/models/{urllib.parse.quote(model)}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.api_key,
+                "User-Agent": "VanturaTileBuilder/2.3",
+            },
+        )
+        self._next_call_ts = time.time() + self.min_interval_s + random.uniform(0.2, 1.2)
+        with urllib.request.urlopen(req, timeout=90) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        cands = body.get("candidates") or []
+        if not cands:
+            return None
+        parts = ((cands[0].get("content") or {}).get("parts") or [])
+        texts = [p.get("text", "") for p in parts if p.get("text") and not p.get("thought")]
+        return "\n".join(texts).strip()
+
+    def translate_batch(self, items, source="wiki", min_len=20):
+        """Tłumaczy paczkę [(idx, lang, name, text), ...] przez Gemini. Zwraca słownik {idx: tekst_pl}."""
+        if not items or not self.any_available():
+            return {}
+        payload_obj = {}
+        src_by_key = {}
+        for pos, (idx, lang, name, text) in enumerate(items):
+            clipped = full_sentences(text, TR_MAX_CHARS, TR_MAX_SENTENCES) or text[:TR_MAX_CHARS]
+            k = str(pos)
+            payload_obj[k] = {"lang": lang, "name": name or "", "text": clipped}
+            src_by_key[k] = (idx, clipped)
+
+        if source == "wiki":
+            rules = (
+                f"Translate each entry's 'text' into natural, accurate, engaging Polish (up to {TR_MAX_SENTENCES} full sentences per entry). "
+                "Keep proper nouns (place, monument, and person names without standard Polish exonyms) unchanged. "
+                "Use ONLY facts and numbers present in the original text; do not invent dates, dimensions, or facts."
+            )
+        else:
+            rules = (
+                "Translate each short map/Wikidata description ('text') into concise, natural Polish. "
+                "Keep proper nouns unchanged and preserve all numbers and dates accurately."
+            )
+        prompt = (
+            f"{rules}\n"
+            "Return ONLY a single valid JSON object mapping the EXACT same string keys (\"0\", \"1\", ...) "
+            "to the Polish translation string. No markdown, no commentary.\n\n"
+            + json.dumps(payload_obj, ensure_ascii=False)
+        )
+
+        for model in list(self._active_models()):
+            rpm_retries = 0
+            while True:
+                try:
+                    raw = self._call_model(model, prompt, expect_json=True)
+                    parsed = _extract_json_object(raw)
+                    if not parsed:
+                        _tr_stat("gemini:zły-json")
+                        return {}
+                    out = {}
+                    for k, (idx, src_txt) in src_by_key.items():
+                        val = parsed.get(k)
+                        if not isinstance(val, str):
+                            continue
+                        tr = clean_wiki_text(val).strip('"')
+                        if len(tr) < min_len:
+                            continue
+                        if not numbers_ok(src_txt, tr):
+                            _tr_stat("gemini:odrzucone-liczby")
+                            continue
+                        if source == "wiki" or len(tr) >= 40:
+                            tr = full_sentences(tr, 1200, TR_MAX_SENTENCES) or (tr if source != "wiki" else "")
+                        if tr and len(tr) >= min_len:
+                            out[idx] = tr
+                    if out:
+                        _tr_stat("gemini:udane", len(out))
+                    return out
+                except urllib.error.HTTPError as e:
+                    err_body = ""
+                    try:
+                        err_body = e.read().decode("utf-8", errors="ignore")[:600]
+                    except Exception:
+                        pass
+                    el = err_body.lower()
+                    if e.code == 400:
+                        flags = self.model_flags.setdefault(model, set())
+                        if "thinking" in el and "no_thinking" not in flags:
+                            flags.add("no_thinking")
+                            continue
+                        if ("responsemimetype" in el or "json" in el) and "no_json" not in flags:
+                            flags.add("no_json")
+                            continue
+                        self.disabled_models.add(model)
+                        break
+                    if e.code == 404:
+                        self.disabled_models.add(model)
+                        break
+                    if e.code in (401, 403):
+                        if "api key" in el or "api_key_invalid" in el or e.code == 401:
+                            self.log(f"  ⚠️ [Gemini] klucz API nieprawidłowy (HTTP {e.code}) — wyłączam Gemini")
+                            self.enabled = False
+                            return {}
+                        self.disabled_models.add(model)
+                        break
+                    if e.code == 429:
+                        is_zero_quota = ("limit: 0" in el) or ("quota_value: 0" in el)
+                        is_daily = is_zero_quota or ("perday" in el) or ("daily" in el)
+                        if is_zero_quota:
+                            self._mark_cooldown(model, seconds=7200, reason="limit=0")
+                            break
+                        if is_daily or rpm_retries >= 1:
+                            self._mark_cooldown(model, reason="limit dzienny/429")
+                            break
+                        # Krótka pauza przy limicie RPM (na minutę)
+                        rpm_retries += 1
+                        wait_s = 15.0 + random.uniform(1.0, 4.0)
+                        m_delay = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', err_body)
+                        if m_delay:
+                            wait_s = min(35.0, max(5.0, float(m_delay.group(1)) + 1.0))
+                        time.sleep(wait_s)
+                        continue
+                    _tr_stat(f"gemini:http-{e.code}")
+                    self._mark_cooldown(model, seconds=300, reason=f"HTTP {e.code}")
+                    break
+                except Exception as e:
+                    _tr_stat(f"gemini:błąd ({type(e).__name__})")
+                    self._mark_cooldown(model, seconds=180, reason=type(e).__name__)
+                    break
+        return {}
 
 
 def ollama_available(url):
@@ -1225,13 +1567,15 @@ def ollama_unload(url, model):
 
 
 def translate_ollama(text, name, url, model, lang="en", source="wiki", min_len=20):
-    """Tłumaczenie przez Ollamę: obsługuje oficjalny format TranslateGemma (wysoka jakość polskiego)
-    oraz ogólne modele (np. qwen2.5:3b) jako fallback."""
-    text = full_sentences(text, 2000, 10) or text[:2000]
+    """Tłumaczenie przez Ollamę: obsługuje oficjalny format TranslateGemma (wysoka jakość polskiego,
+    zoptymalizowany pod do 5 zdań i niższy num_ctx na CPU) oraz ogólne modele jako fallback."""
+    text = full_sentences(text, TR_MAX_CHARS, TR_MAX_SENTENCES) or text[:TR_MAX_CHARS]
     base = url.split("/api/")[0]
     is_tg = "translategemma" in (model or "").lower()
     src_code = lang if lang in LANG_NAMES_EN else "en"
     src_en = LANG_NAMES_EN.get(src_code, "English")
+    num_ctx = 1536 if len(text) <= 700 else 2048
+    num_predict = min(480, max(160, int(len(text) * 0.65)))
 
     try:
         if is_tg:
@@ -1247,8 +1591,8 @@ def translate_ollama(text, name, url, model, lang="en", source="wiki", min_len=2
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
-                "keep_alive": "5m",
-                "options": {"temperature": 0.1, "num_predict": 900, "num_ctx": 4096},
+                "keep_alive": "10m",
+                "options": {"temperature": 0.1, "num_predict": num_predict, "num_ctx": num_ctx},
             }).encode()
             req = urllib.request.Request(base + "/api/chat", data=body, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=240) as r:
@@ -1257,14 +1601,14 @@ def translate_ollama(text, name, url, model, lang="en", source="wiki", min_len=2
             where = f"z {LANG_NAMES_PL.get(lang, 'obcojęzycznej')} Wikipedii" if source == "wiki" else "(opis obiektu z mapy, w języku obcym)"
             prompt = (
                 f"Przetłumacz poniższy tekst {where} na naturalny, ciekawy i poprawny język polski "
-                "(zachowaj wszystkie ważne informacje, do 10 pełnych zdań). "
+                f"(zachowaj wszystkie ważne informacje, do {TR_MAX_SENTENCES} pełnych zdań). "
                 "Nazwy własne (nazwiska, nazwy obiektów i miejscowości bez polskiej nazwy) zostaw bez zmian. "
                 "Używaj WYŁĄCZNIE informacji z tekstu. Nie dodawaj żadnych faktów, dat, liczb ani ocen. "
                 f"Obiekt: {name}.\nTEKST:\n{text}\nTŁUMACZENIE:"
             )
             body = json.dumps({
-                "model": model, "prompt": prompt, "stream": False, "keep_alive": "5m",
-                "options": {"temperature": 0.1, "num_predict": 900, "num_ctx": 4096},
+                "model": model, "prompt": prompt, "stream": False, "keep_alive": "10m",
+                "options": {"temperature": 0.1, "num_predict": num_predict, "num_ctx": num_ctx},
             }).encode()
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=240) as r:
@@ -1280,10 +1624,56 @@ def translate_ollama(text, name, url, model, lang="en", source="wiki", min_len=2
     if not numbers_ok(text, out):
         _tr_stat("llm:odrzucone-liczby")
         return None
-    res = full_sentences(out) if (source == "wiki" or len(out) >= 40) else out
+    res = full_sentences(out, 1200, TR_MAX_SENTENCES) if (source == "wiki" or len(out) >= 40) else out
     res = res or (out if source != "wiki" else None)
     _tr_stat("llm:udane" if res else "llm:bez-zdań")
     return res
+
+
+def translate_ollama_short_batch(items, url, model, lang="en", min_len=8):
+    """Tłumaczy paczkę krótkich opisów (OSM / Wikidata) w jednym wywołaniu Ollamy (5-8x szybciej na CPU).
+    items: [(idx, text), ...]. Zwraca słownik {idx: tekst_pl}."""
+    if not items:
+        return {}
+    if len(items) == 1:
+        tr = translate_ollama(items[0][1], "", url, model, lang=lang, source="osm", min_len=min_len)
+        return {items[0][0]: tr} if tr else {}
+    base = url.split("/api/")[0]
+    src_code = lang if lang in LANG_NAMES_EN else "en"
+    src_en = LANG_NAMES_EN.get(src_code, "English")
+    lines = [f"[{p}] {re.sub(r'\s+', ' ', txt).strip()[:280]}" for p, (_, txt) in enumerate(items)]
+    joined = "\n".join(lines)
+    prompt = (
+        f"You are a professional {src_en} ({src_code}) to Polish (pl) translator. "
+        "Translate each numbered line below into natural Polish. Keep proper nouns unchanged. "
+        "Keep the exact [0], [1], ... prefix on each line and output ONLY the translated lines:\n\n\n"
+        + joined
+    )
+    try:
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "keep_alive": "10m",
+            "options": {"temperature": 0.1, "num_predict": min(600, max(180, len(joined))), "num_ctx": 1536},
+        }).encode()
+        req = urllib.request.Request(base + "/api/chat", data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=240) as r:
+            raw = (json.loads(r.read().decode("utf-8")).get("message") or {}).get("content", "").strip()
+    except Exception as e:
+        _tr_stat(f"llm:błąd ({type(e).__name__})")
+        return {}
+    out = {}
+    for m in re.finditer(r"^\[(\d+)\]\s*(.+)$", raw, flags=re.M):
+        pos = int(m.group(1))
+        if 0 <= pos < len(items):
+            idx, src_txt = items[pos]
+            tr = clean_wiki_text(m.group(2)).strip('"')
+            if len(tr) >= min_len and numbers_ok(src_txt, tr):
+                out[idx] = tr
+    if out:
+        _tr_stat("llm:udane", len(out))
+    return out
 
 
 def translate_en_pl(text, name, url, model, lang="en", source="wiki"):
@@ -1398,16 +1788,20 @@ def _txt_cache_key(lang, src_txt):
 
 # ------------------------------------------------------------------ główna funkcja etapu
 def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_areas=None,
-                        tr_cache=None, save_cache=None, deadline_ts=None):
+                        tr_cache=None, save_cache=None, deadline_ts=None,
+                        shard_index=0, shard_total=1, translate_only=False):
     """Ustawia p['description'] i p['desc_source'] ('wiki_pl' | 'wiki_<lang>_pl' | 'osm') dla KAŻDEGO POI.
-    Bez rang i bez ucinania punktów: wszystkie obcojęzyczne artykuły Wikipedii, opisy OSM i opisy Wikidata
-    są tłumaczone wyłącznie przez TranslateGemma 4B (Ollama). Jeśli bardzo gęsty kafel osiągnie limit czasu
-    zadania (deadline_ts), zapisuje postęp w pamięci tłumaczeń (save_cache) i zwraca stats['incomplete']=True,
-    aby kolejna runda dokończyła resztę bez powtarzania już przetłumaczonych punktów."""
+    Priorytet tłumaczeń (do TR_MAX_SENTENCES=5 zdań):
+      1) Darmowe Google Gemini API (w paczkach po kilkanaście opisów naraz),
+      2) Po wyczerpaniu dziennego limitu Gemini: automatyczny powrót na lokalny TranslateGemma 4B (Ollama),
+         a po odnowieniu limitu (cooldown / północ PT) automatyczny powrót na Gemini.
+    Obsługuje równoległe dzielenie pracy na wiele maszyn (shard_index / shard_total + translate_only=True)."""
     contact = os.environ.get("WIKI_CONTACT", "").strip()
     llm_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
     llm_model = os.environ.get("OLLAMA_MODEL", "translategemma:4b")
     llm_max = int(os.environ.get("LLM_MAX_PER_TILE", "999999"))
+    shard_total = max(1, int(shard_total))
+    shard_index = max(0, min(shard_total - 1, int(shard_index)))
     stats = {"wiki_pl": 0, "wiki_en_pl": 0, "osm": 0, "incomplete": False}
     cache = dict(tr_cache) if tr_cache else {}
     local_tr = {}
@@ -1474,16 +1868,16 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
 
     has_pl = {i for i, t in pl_title.items() if pl_txt.get(t)}
 
-    # "Czytaj więcej" (do 10 zdań) dla KAŻDEGO artykułu polskiej Wikipedii o krótkim wstępie (< 5 zdań)
+    # "Czytaj więcej" (do 10 zdań) dla polskiej Wikipedii (pomijamy w trybie samego shard-tłumaczenia)
     long_max = int(os.environ.get("WIKI_LONG_MAX_PER_TILE", "10000"))
-    if wiki and long_max > 0:
+    if wiki and long_max > 0 and not translate_only:
         short_ones = [i for i in has_pl if len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))) < 5]
         got = 0
         for i in short_ones[:long_max]:
             if deadline_ts and time.time() >= deadline_ts:
                 break
             try:
-                longer = wiki.article_start("pl", pl_title[i])
+                longer = wiki.article_start("pl", pl_title[i], max_sentences=10)
             except Exception:
                 continue
             if len(_split_sentences(full_sentences(longer))) > len(_split_sentences(full_sentences(pl_txt[pl_title[i]]))):
@@ -1508,13 +1902,13 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
         i for i, p in enumerate(pois)
         if i not in has_pl and i not in en_title and i not in other_title
         and (p.get("_wd") or {}).get("desc_en") and not (p.get("_wd") or {}).get("desc_pl")
+        and not _is_trivial_wd_desc((p.get("_wd") or {}).get("desc_en"))
     ]
 
-    # Zastosuj istniejące tłumaczenia z pamięci (własnej z poprzedniej rundy + sąsiednich kafli)
+    # Zastosuj istniejące tłumaczenia z pamięci (własnej z poprzedniej rundy + shardów + sąsiednich kafli)
     translated = {}
     cache_hits = 0
     todo_wiki = []
-    seen_wiki_keys = set()
     for kind, i in ([("en", i) for i in en_queue] + [("other", i) for i in other_queue]):
         lang = "en" if kind == "en" else other_title[i][0]
         title = en_title[i] if kind == "en" else other_title[i][1]
@@ -1526,9 +1920,10 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
             translated[i] = hit[1]
             if hit[0] and hit[0] != "en":
                 pois[i]["_tr_lang"] = hit[0]
-            local_tr[wkey] = hit
-            if wdkey:
-                local_tr[wdkey] = hit
+            if not translate_only:
+                local_tr[wkey] = hit
+                if wdkey:
+                    local_tr[wdkey] = hit
             cache_hits += 1
         else:
             todo_wiki.append((kind, i, lang, title, wkey, wdkey))
@@ -1542,7 +1937,8 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
         hit = cache.get(ckey)
         if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
             pois[i]["_desc_translated"] = hit[1]
-            local_tr[ckey] = hit
+            if not translate_only:
+                local_tr[ckey] = hit
             cache_hits += 1
         else:
             todo_osm.append((i, dlang, src_d, ckey))
@@ -1554,7 +1950,8 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
         hit = cache.get(ckey)
         if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
             pois[i]["_wd"]["desc_en_pl"] = hit[1]
-            local_tr[ckey] = hit
+            if not translate_only:
+                local_tr[ckey] = hit
             cache_hits += 1
         else:
             todo_wd.append((i, src_d, ckey))
@@ -1562,13 +1959,33 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
     if cache_hits:
         log(f"  [Cache tłumaczeń] odzyskano gotowych tłumaczeń (sąsiednie kafle / poprzednia runda): {cache_hits}")
 
-    # Tłumaczenia wyłącznie przez TranslateGemma 4B (Ollama) — bez rang, KAŻDY punkt, z zapisem postępu
+    # Deterministyczna kolejność po kluczu + deduplikacja unikalnych artykułów przed podziałem na shardy
+    todo_wiki.sort(key=lambda x: (0 if x[0] == "en" else 1, x[4], x[1]))
+    todo_osm.sort(key=lambda x: (x[3], x[0]))
+    todo_wd.sort(key=lambda x: (x[2], x[0]))
+
+    if shard_total > 1:
+        def _shard_filter(rows, key_fn):
+            uniq_keys = list(dict.fromkeys(key_fn(r) for r in rows))
+            my_keys = {k for pos, k in enumerate(uniq_keys) if pos % shard_total == shard_index}
+            return [r for r in rows if key_fn(r) in my_keys]
+        todo_wiki = _shard_filter(todo_wiki, lambda r: r[4])
+        todo_osm = _shard_filter(todo_osm, lambda r: r[3])
+        todo_wd = _shard_filter(todo_wd, lambda r: r[2])
+        log(f"  [Shard {shard_index + 1}/{shard_total}] przydział: {len(todo_wiki)} Wiki + {len(todo_osm)} OSM + {len(todo_wd)} Wikidata")
+
+    # Tłumaczenia: priorytetowo darmowe Google Gemini (paczki), po limicie płynnie TranslateGemma 4B (Ollama)
     TR_STATS.clear()
     t_tr_start = time.time()
     total_todo = len(todo_wiki) + len(todo_osm) + len(todo_wd)
+    par_workers = int(os.environ.get("GEMINI_PARALLEL_WORKERS", str(shard_total if shard_total > 1 else 1)))
+    worker_slot = int(os.environ.get("JOB_INDEX", str(shard_index)))
+    gemini = GeminiTranslator(log=log, parallel_workers=par_workers, worker_slot=worker_slot) if (llm_max > 0 and total_todo > 0) else None
     ollama_ok = llm_max > 0 and total_todo > 0 and ollama_available(llm_url)
+    gemini_batch_wiki = max(1, int(os.environ.get("GEMINI_BATCH_SIZE", "15")))
+    gemini_batch_short = max(1, int(os.environ.get("GEMINI_SHORT_BATCH_SIZE", "25")))
 
-    if ollama_ok:
+    if (gemini and gemini.enabled) or ollama_ok:
         foreign_long_max = int(os.environ.get("WIKI_FOREIGN_LONG_MAX", "10000"))
         llm_done = 0
         since_save = 0
@@ -1576,6 +1993,8 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
         last_save_t = time.time()
         incomplete = False
         fgot = 0
+        failed_keys = set()
+        gemini_missed = set()
 
         def checkpoint(force_save=False):
             nonlocal since_save, last_save_t
@@ -1584,32 +2003,103 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
                 since_save = 0
                 last_save_t = time.time()
 
-        # 1. Wszystkie obcojęzyczne artykuły Wikipedii (każdy do 10 zdań pod "Czytaj więcej")
-        for idx_w, (kind, i, lang, title, wkey, wdkey) in enumerate(todo_wiki):
-            if llm_done >= llm_max:
-                break
-            # Jeśli inny POI w tym samym kaflu już przetłumaczył ten sam artykuł chwilę temu — użyj od razu!
+        def prepare_wiki_src(kind, lang, title):
+            nonlocal fgot
+            src_txt = en_txt[title] if kind == "en" else other_txt[(lang, title)]
+            # Dociągamy do 5 zdań (nie 10!) tylko jeśli wstęp miał < 3 zdania
+            if wiki and fgot < foreign_long_max and len(_split_sentences(full_sentences(src_txt, TR_MAX_CHARS, TR_MAX_SENTENCES))) < 3:
+                try:
+                    longer = wiki.article_start(lang, title, max_sentences=TR_MAX_SENTENCES)
+                    if len(_split_sentences(full_sentences(longer, TR_MAX_CHARS, TR_MAX_SENTENCES))) > len(_split_sentences(full_sentences(src_txt, TR_MAX_CHARS, TR_MAX_SENTENCES))):
+                        src_txt = longer
+                        fgot += 1
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            return full_sentences(src_txt, TR_MAX_CHARS, TR_MAX_SENTENCES) or src_txt[:TR_MAX_CHARS]
+
+        # 1. Wszystkie obcojęzyczne artykuły Wikipedii (do TR_MAX_SENTENCES=5 zdań)
+        pos_w = 0
+        while pos_w < len(todo_wiki) and llm_done < llm_max:
+            kind, i, lang, title, wkey, wdkey = todo_wiki[pos_w]
             hit = cache.get(wkey) or (cache.get(wdkey) if wdkey else None)
             if hit and isinstance(hit, list) and len(hit) == 2 and hit[1]:
                 translated[i] = hit[1]
                 if hit[0] and hit[0] != "en":
                     pois[i]["_tr_lang"] = hit[0]
+                pos_w += 1
+                continue
+            if wkey in failed_keys:
+                pos_w += 1
                 continue
             if deadline_ts and time.time() >= deadline_ts:
                 incomplete = True
-                log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({idx_w}/{len(todo_wiki)} artykułów Wikipedii); dokończy kolejna runda")
+                log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({pos_w}/{len(todo_wiki)} artykułów Wikipedii); dokończy kolejna runda")
                 break
-            src_txt = en_txt[title] if kind == "en" else other_txt[(lang, title)]
-            # Dobierz do 10 zdań tuż przed tłumaczeniem (tylko dla jeszcze nieprzetłumaczonego artykułu)
-            if wiki and fgot < foreign_long_max and len(_split_sentences(full_sentences(src_txt))) < 4:
-                try:
-                    longer = wiki.article_start(lang, title)
-                    if len(_split_sentences(full_sentences(longer))) > len(_split_sentences(full_sentences(src_txt))):
-                        src_txt = longer
-                        fgot += 1
-                except Exception:
-                    pass
-                time.sleep(0.06)
+
+            can_gemini = wkey not in gemini_missed
+            use_gemini_now = bool(can_gemini and gemini and gemini.ready_now())
+            wait_for_gemini = bool(can_gemini and gemini and gemini.any_available() and (not ollama_ok or gemini.seconds_until_ready() <= 15.0))
+            if wait_for_gemini and not use_gemini_now:
+                sleep_s = gemini.seconds_until_ready()
+                if deadline_ts:
+                    sleep_s = min(sleep_s, max(0.0, deadline_ts - time.time()))
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                use_gemini_now = bool(gemini.ready_now())
+
+            if use_gemini_now:
+                # Zbierz paczkę unikalnych artykułów dla Gemini
+                batch_meta = []
+                batch_items = []
+                seen_batch = set()
+                scan = pos_w
+                while scan < len(todo_wiki) and len(batch_items) < gemini_batch_wiki and (llm_done + len(batch_items)) < llm_max:
+                    bk, bi, bl, bt, bwk, bwdk = todo_wiki[scan]
+                    scan += 1
+                    if bwk in seen_batch or bwk in failed_keys or bwk in gemini_missed:
+                        continue
+                    bhit = cache.get(bwk) or (cache.get(bwdk) if bwdk else None)
+                    if bhit and isinstance(bhit, list) and len(bhit) == 2 and bhit[1]:
+                        continue
+                    seen_batch.add(bwk)
+                    bsrc = prepare_wiki_src(bk, bl, bt)
+                    batch_meta.append((bk, bi, bl, bt, bwk, bwdk, bsrc))
+                    batch_items.append((bi, bl, pois[bi].get("name"), bsrc))
+                res_map = gemini.translate_batch(batch_items, source="wiki", min_len=20)
+                if res_map:
+                    for bk, bi, bl, bt, bwk, bwdk, _ in batch_meta:
+                        tr = res_map.get(bi)
+                        if tr:
+                            translated[bi] = tr
+                            if bk == "other":
+                                pois[bi]["_tr_lang"] = bl
+                            entry = [bl, tr]
+                            cache[bwk] = entry
+                            local_tr[bwk] = entry
+                            if bwdk:
+                                cache[bwdk] = entry
+                                local_tr[bwdk] = entry
+                            llm_done += 1
+                            since_save += 1
+                        else:
+                            gemini_missed.add(bwk)
+                    checkpoint()
+                    continue
+                # Jeśli Gemini nic nie zwrócił (np. właśnie trafił w limit dzienny), przejdź płynnie do Ollamy dla bieżącego wpisu
+
+            if not ollama_ok:
+                if wkey in gemini_missed:
+                    failed_keys.add(wkey)
+                    pos_w += 1
+                    continue
+                if gemini and gemini.any_available():
+                    continue
+                incomplete = True
+                log(f"  ⏸️ Limit API Gemini wyczerpany i brak Ollamy — zapisano postęp ({pos_w}/{len(todo_wiki)}); dokończy kolejna runda")
+                break
+
+            src_txt = prepare_wiki_src(kind, lang, title)
             before_err = sum(v for k, v in TR_STATS.items() if k.startswith("llm:błąd"))
             tr = translate_ollama(src_txt, pois[i].get("name"), llm_url, llm_model, lang, "wiki")
             after_err = sum(v for k, v in TR_STATS.items() if k.startswith("llm:błąd"))
@@ -1622,6 +2112,7 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
             else:
                 consec_err = 0
             llm_done += 1
+            pos_w += 1
             if tr:
                 translated[i] = tr
                 if kind == "other":
@@ -1634,55 +2125,212 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
                     local_tr[wdkey] = entry
                 since_save += 1
                 checkpoint()
+            else:
+                failed_keys.add(wkey)
 
-        # 2. Obcojęzyczne opisy z OSM (krótkie)
+        # 2. Obcojęzyczne opisy z OSM (paczki w Gemini, paczki/pojedyncze w TranslateGemma)
         if not incomplete:
-            for idx_o, (i, dlang, src_d, ckey) in enumerate(todo_osm):
-                if llm_done >= llm_max:
-                    break
+            pos_o = 0
+            while pos_o < len(todo_osm) and llm_done < llm_max:
+                i, dlang, src_d, ckey = todo_osm[pos_o]
                 if ckey in cache:
                     pois[i]["_desc_translated"] = cache[ckey][1]
+                    pos_o += 1
+                    continue
+                if ckey in failed_keys:
+                    pos_o += 1
                     continue
                 if deadline_ts and time.time() >= deadline_ts:
                     incomplete = True
-                    log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({idx_o}/{len(todo_osm)} opisów OSM); dokończy kolejna runda")
+                    log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({pos_o}/{len(todo_osm)} opisów OSM); dokończy kolejna runda")
                     break
-                tr = translate_ollama(src_d, pois[i].get("name"), llm_url, llm_model, dlang, "osm", min_len=12)
-                llm_done += 1
-                if tr:
-                    pois[i]["_desc_translated"] = tr
-                    entry = [dlang, tr]
-                    cache[ckey] = entry
-                    local_tr[ckey] = entry
-                    since_save += 1
-                    checkpoint()
 
-        # 3. Krótkie angielskie opisy z Wikidata (desc_en) — dają konkretny kontekst punktom bez Wikipedii
-        if not incomplete:
-            for idx_d, (i, src_d, ckey) in enumerate(todo_wd):
-                if llm_done >= llm_max:
+                can_gemini = ckey not in gemini_missed
+                use_gemini_now = bool(can_gemini and gemini and gemini.ready_now())
+                if not use_gemini_now and can_gemini and gemini and gemini.any_available() and (not ollama_ok or gemini.seconds_until_ready() <= 15.0):
+                    sleep_s = gemini.seconds_until_ready()
+                    if deadline_ts:
+                        sleep_s = min(sleep_s, max(0.0, deadline_ts - time.time()))
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    use_gemini_now = bool(gemini.ready_now())
+
+                if use_gemini_now:
+                    b_meta, b_items, seen_b = [], [], set()
+                    scan = pos_o
+                    while scan < len(todo_osm) and len(b_items) < gemini_batch_short and (llm_done + len(b_items)) < llm_max:
+                        bi, bl, bs, bck = todo_osm[scan]
+                        scan += 1
+                        if bck in seen_b or bck in cache or bck in failed_keys or bck in gemini_missed:
+                            continue
+                        seen_b.add(bck)
+                        b_meta.append((bi, bl, bs, bck))
+                        b_items.append((bi, bl, pois[bi].get("name"), bs))
+                    res_map = gemini.translate_batch(b_items, source="osm", min_len=12)
+                    if res_map:
+                        for bi, bl, _, bck in b_meta:
+                            tr = res_map.get(bi)
+                            if tr:
+                                pois[bi]["_desc_translated"] = tr
+                                entry = [bl, tr]
+                                cache[bck] = entry
+                                local_tr[bck] = entry
+                                llm_done += 1
+                                since_save += 1
+                            else:
+                                gemini_missed.add(bck)
+                        checkpoint()
+                        continue
+
+                if not ollama_ok:
+                    if ckey in gemini_missed:
+                        failed_keys.add(ckey)
+                        pos_o += 1
+                        continue
+                    if gemini and gemini.any_available():
+                        continue
+                    incomplete = True
                     break
+
+                # Paczka krótkich opisów OSM tego samego języka w Ollama (do 6 naraz)
+                b_meta, b_items, seen_b = [], [], set()
+                scan = pos_o
+                while scan < len(todo_osm) and len(b_items) < 6 and (llm_done + len(b_items)) < llm_max:
+                    bi, bl, bs, bck = todo_osm[scan]
+                    if bl != dlang or len(bs) > 220:
+                        break
+                    scan += 1
+                    if bck in seen_b or bck in cache or bck in failed_keys:
+                        continue
+                    seen_b.add(bck)
+                    b_meta.append((bi, bl, bs, bck))
+                    b_items.append((bi, bs))
+                if len(b_items) >= 2:
+                    res_map = translate_ollama_short_batch(b_items, llm_url, llm_model, lang=dlang, min_len=12)
+                    for bi, bl, _, bck in b_meta:
+                        tr = res_map.get(bi)
+                        if tr:
+                            pois[bi]["_desc_translated"] = tr
+                            entry = [bl, tr]
+                            cache[bck] = entry
+                            local_tr[bck] = entry
+                            llm_done += 1
+                            since_save += 1
+                        else:
+                            failed_keys.add(bck)
+                    pos_o = scan
+                    checkpoint()
+                else:
+                    tr = translate_ollama(src_d, pois[i].get("name"), llm_url, llm_model, dlang, "osm", min_len=12)
+                    llm_done += 1
+                    pos_o += 1
+                    if tr:
+                        pois[i]["_desc_translated"] = tr
+                        entry = [dlang, tr]
+                        cache[ckey] = entry
+                        local_tr[ckey] = entry
+                        since_save += 1
+                        checkpoint()
+                    else:
+                        failed_keys.add(ckey)
+
+        # 3. Informacyjne angielskie opisy z Wikidata (desc_en) — zawsze paczkami!
+        if not incomplete:
+            pos_d = 0
+            while pos_d < len(todo_wd) and llm_done < llm_max:
+                i, src_d, ckey = todo_wd[pos_d]
                 if ckey in cache:
                     pois[i]["_wd"]["desc_en_pl"] = cache[ckey][1]
+                    pos_d += 1
+                    continue
+                if ckey in failed_keys:
+                    pos_d += 1
                     continue
                 if deadline_ts and time.time() >= deadline_ts:
                     incomplete = True
-                    log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({idx_d}/{len(todo_wd)} opisów Wikidata); dokończy kolejna runda")
+                    log(f"  ⏸️ Limit czasu etapu tłumaczeń — zapisano postęp ({pos_d}/{len(todo_wd)} opisów Wikidata); dokończy kolejna runda")
                     break
-                tr = translate_ollama(src_d, pois[i].get("name"), llm_url, llm_model, "en", "osm", min_len=8)
-                llm_done += 1
-                if tr:
-                    pois[i]["_wd"]["desc_en_pl"] = tr
-                    entry = ["en", tr]
-                    cache[ckey] = entry
-                    local_tr[ckey] = entry
-                    since_save += 1
-                    checkpoint()
 
-        ollama_unload(llm_url, llm_model)
+                can_gemini = ckey not in gemini_missed
+                use_gemini_now = bool(can_gemini and gemini and gemini.ready_now())
+                if not use_gemini_now and can_gemini and gemini and gemini.any_available() and (not ollama_ok or gemini.seconds_until_ready() <= 15.0):
+                    sleep_s = gemini.seconds_until_ready()
+                    if deadline_ts:
+                        sleep_s = min(sleep_s, max(0.0, deadline_ts - time.time()))
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                    use_gemini_now = bool(gemini.ready_now())
+
+                if use_gemini_now:
+                    b_meta, b_items, seen_b = [], [], set()
+                    scan = pos_d
+                    while scan < len(todo_wd) and len(b_items) < gemini_batch_short and (llm_done + len(b_items)) < llm_max:
+                        bi, bs, bck = todo_wd[scan]
+                        scan += 1
+                        if bck in seen_b or bck in cache or bck in failed_keys or bck in gemini_missed:
+                            continue
+                        seen_b.add(bck)
+                        b_meta.append((bi, bs, bck))
+                        b_items.append((bi, "en", pois[bi].get("name"), bs))
+                    res_map = gemini.translate_batch(b_items, source="osm", min_len=8)
+                    if res_map:
+                        for bi, _, bck in b_meta:
+                            tr = res_map.get(bi)
+                            if tr:
+                                pois[bi]["_wd"]["desc_en_pl"] = tr
+                                entry = ["en", tr]
+                                cache[bck] = entry
+                                local_tr[bck] = entry
+                                llm_done += 1
+                                since_save += 1
+                            else:
+                                gemini_missed.add(bck)
+                        checkpoint()
+                        continue
+
+                if not ollama_ok:
+                    if ckey in gemini_missed:
+                        failed_keys.add(ckey)
+                        pos_d += 1
+                        continue
+                    if gemini and gemini.any_available():
+                        continue
+                    incomplete = True
+                    break
+
+                b_meta, b_items, seen_b = [], [], set()
+                scan = pos_d
+                while scan < len(todo_wd) and len(b_items) < 8 and (llm_done + len(b_items)) < llm_max:
+                    bi, bs, bck = todo_wd[scan]
+                    scan += 1
+                    if bck in seen_b or bck in cache or bck in failed_keys:
+                        continue
+                    seen_b.add(bck)
+                    b_meta.append((bi, bs, bck))
+                    b_items.append((bi, bs))
+                if b_items:
+                    res_map = translate_ollama_short_batch(b_items, llm_url, llm_model, lang="en", min_len=8)
+                    for bi, _, bck in b_meta:
+                        tr = res_map.get(bi)
+                        if tr:
+                            pois[bi]["_wd"]["desc_en_pl"] = tr
+                            entry = ["en", tr]
+                            cache[bck] = entry
+                            local_tr[bck] = entry
+                            llm_done += 1
+                            since_save += 1
+                        else:
+                            failed_keys.add(bck)
+                    pos_d = scan
+                    checkpoint()
+                else:
+                    pos_d = scan
+
+        if ollama_ok:
+            ollama_unload(llm_url, llm_model)
         checkpoint(force_save=True)
-        log(f"  [Tłumaczenia TranslateGemma] do przetłumaczenia: {len(todo_wiki)} Wiki + {len(todo_osm)} OSM + {len(todo_wd)} Wikidata "
-            f"| z cache: {cache_hits} | rozszerzonych do 10 zdań: {fgot} | wynik: {TR_STATS or 'brak prób'} | {time.time() - t_tr_start:.0f} s")
+        log(f"  [Tłumaczenia AI] do przetłumaczenia: {len(todo_wiki)} Wiki + {len(todo_osm)} OSM + {len(todo_wd)} Wikidata "
+            f"| z cache: {cache_hits} | dociągnięto do {TR_MAX_SENTENCES} zdań: {fgot} | wynik: {TR_STATS or 'brak prób'} | {time.time() - t_tr_start:.0f} s")
         if incomplete:
             stats["incomplete"] = True
             return stats
@@ -1690,7 +2338,10 @@ def enrich_descriptions(pois, log=print, places=None, geo_wiki=None, protected_a
         if save_cache and local_tr:
             save_cache(local_tr)
         if llm_max > 0 and total_todo > 0:
-            log(f"  ⚠️ Model TranslateGemma niedostępny ({llm_url}) - {total_todo} opisów bez tłumaczenia")
+            log(f"  ⚠️ Brak Gemini API i modelu TranslateGemma ({llm_url}) - {total_todo} opisów bez tłumaczenia")
+
+    if translate_only:
+        return stats
 
     for i, p in enumerate(pois):
         desc, src = None, None
