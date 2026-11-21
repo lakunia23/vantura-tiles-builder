@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kraje:
-        description: "world = cały świat (najpierw Polska i sąsiedzi) albo kraje po przecinku, np. poland"
+        description: "world = cały świat (najpierw Polska i sąsiedzi) albo kraje po przecinku, np. liechtenstein lub poland"
         required: true
         default: "world"
       partia:
@@ -12,7 +12,7 @@ on:
         required: true
         default: "1"
       runda:
-        description: "Runda (zostaw 1; kolejne rundy wznawiają tłumaczenia gęstych kafli i uzupełniają braki)"
+        description: "Runda (zostaw 1; kolejne rundy same wznawiają gęste kafle i uzupełniają braki)"
         required: true
         default: "1"
 
@@ -28,8 +28,16 @@ jobs:
   lista:
     runs-on: ubuntu-latest
     outputs:
+      done: ${{ steps.lista.outputs.done }}
+      mode: ${{ steps.lista.outputs.mode }}
       bloki: ${{ steps.lista.outputs.bloki }}
+      shards: ${{ steps.lista.outputs.shards }}
       partie: ${{ steps.lista.outputs.partie }}
+      next_batch: ${{ steps.lista.outputs.next_batch }}
+      has_more_batches: ${{ steps.lista.outputs.has_more_batches }}
+      remaining: ${{ steps.lista.outputs.remaining }}
+      gemini_workers: ${{ steps.lista.outputs.gemini_workers }}
+      check_tiles: ${{ steps.lista.outputs.check_tiles }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,23 +45,103 @@ jobs:
           python-version: "3.12"
       - name: Biblioteki
         run: pip install osmium shapely
-      - name: Lista bloków kafli
+      - name: Lista kafli do zbudowania
         id: lista
         working-directory: builder
         env:
+          GH_TOKEN: ${{ github.token }}
           DRY_RUN: "1"
+          UPLOAD_TARGET: github
+          SKIP_EXISTING: "1"
+          SHARD_ENABLE: ${{ (vars.TLUMACZENIA_AI || '1') == '0' && '0' || '1' }}
+          SHARD_THRESHOLD: "6"
+          SHARD_MAX: "12"
           PIN_COUNTRIES: ${{ inputs.kraje }}
           BATCH: ${{ inputs.partia }}
           BLOCK: "2"
         run: |
           mkdir -p data grid_work_v2
           python BuildWorldGrid_v2.py --list-tiles > lista.txt
-          cat lista.txt | grep "^PARTIE="
+          grep -E "^(PARTIE|DONE|MODE|NEXT_BATCH|HAS_MORE_BATCHES|REMAINING|GEMINI_WORKERS|CHECK_TILES)=" lista.txt
           echo "partie=$(grep '^PARTIE=' lista.txt | sed 's/^PARTIE=\([0-9]*\).*/\1/')" >> "$GITHUB_OUTPUT"
+          echo "done=$(grep '^DONE=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "mode=$(grep '^MODE=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "next_batch=$(grep '^NEXT_BATCH=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "has_more_batches=$(grep '^HAS_MORE_BATCHES=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "remaining=$(grep '^REMAINING=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "gemini_workers=$(grep '^GEMINI_WORKERS=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "check_tiles=$(grep '^CHECK_TILES=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "shards=$(grep '^SHARDS=' lista.txt | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
           echo "bloki=$(tail -n 1 lista.txt)" >> "$GITHUB_OUTPUT"
 
-  kafle:
+  tlumacz:
     needs: lista
+    if: needs.lista.outputs.done != '1' && needs.lista.outputs.mode == 'sharded'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix: ${{ fromJSON(needs.lista.outputs.shards) }}
+    steps:
+      - name: Więcej miejsca na dysku
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Programy
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q osmctools
+          pip install osmium shapely
+      - name: Model językowy TranslateGemma 4B (zapasowy po limicie Gemini)
+        if: (vars.TLUMACZENIA_AI || '1') != '0'
+        continue-on-error: true
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
+            OLLAMA_FLASH_ATTENTION=1 OLLAMA_KEEP_ALIVE=10m nohup ollama serve </dev/null > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          fi
+          for i in $(seq 1 30); do curl -sf http://localhost:11434/api/tags > /dev/null && break; sleep 2; done
+          ollama pull translategemma:4b
+      - name: Równoległe tłumaczenie ${{ matrix.tile }} (część ${{ matrix.shard_index }}/${{ matrix.shard_total }})
+        working-directory: builder
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_TARGET: github
+          WIKI_CONTACT: ${{ secrets.WIKI_CONTACT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_PARALLEL_WORKERS: ${{ needs.lista.outputs.gemini_workers }}
+          JOB_INDEX: ${{ strategy.job-index }}
+          TILE_LANG: pl
+          PIN_COUNTRIES: ${{ inputs.kraje }}
+          ONLY_TILES: ${{ matrix.tile }}
+          TRANSLATE_ONLY: "1"
+          SHARD_INDEX: ${{ matrix.shard_index }}
+          SHARD_TOTAL: ${{ matrix.shard_total }}
+          WORKERS: "1"
+          BUFFER_DEG: "0.4"
+          USE_O5M: "0"
+          DATA_MAX_GB: "40"
+          OLLAMA_MODEL: "translategemma:4b"
+          LLM_MAX_PER_TILE: "999999"
+          TR_MAX_SENTENCES: "5"
+          TR_MAX_CHARS: "1050"
+          TRANSLATE_MAX_S: "15000"
+          WIKI_FOREIGN_LONG_MAX: "10000"
+          WIKI_GEOSEARCH_MAX: "200"
+          MAX_RUNTIME_S: "18900"
+        run: |
+          mkdir -p data grid_work_v2
+          python -u BuildWorldGrid_v2.py
+          if [ -s grid_work_v2/paused_tiles_v2.txt ]; then echo "⏸️ Postęp części zapisany — dokończy kolejna runda."; fi
+
+  kafle:
+    needs: [lista, tlumacz]
+    if: always() && needs.lista.result == 'success' && needs.lista.outputs.done != '1' && needs.lista.outputs.mode != 'wrap' && (needs.tlumacz.result == 'success' || needs.tlumacz.result == 'failure' || needs.tlumacz.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -78,21 +166,16 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q osmctools
           pip install osmium shapely
-      - name: Model językowy TranslateGemma 4B (tłumaczenia na polski — każdy punkt)
+      - name: Model językowy TranslateGemma 4B (zapasowy po limicie Gemini)
         if: (vars.TLUMACZENIA_AI || '1') != '0'
         continue-on-error: true
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
-          # serwer modelu: gdy usługa systemowa nie wystartowała, uruchamiamy go sami
           if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
-            nohup ollama serve </dev/null > "$RUNNER_TEMP/ollama.log" 2>&1 &
+            OLLAMA_FLASH_ATTENTION=1 OLLAMA_KEEP_ALIVE=10m nohup ollama serve </dev/null > "$RUNNER_TEMP/ollama.log" 2>&1 &
           fi
           for i in $(seq 1 30); do curl -sf http://localhost:11434/api/tags > /dev/null && break; sleep 2; done
           ollama pull translategemma:4b
-          # test: jedno krótkie tłumaczenie (czas i jakość widać w logu; keep_alive=0 od razu zwalnia RAM)
-          start=$(date +%s)
-          curl -sf http://localhost:11434/api/chat -d '{"model":"translategemma:4b","messages":[{"role":"user","content":"You are a professional English (en) to Polish (pl) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Polish grammar, vocabulary, and cultural sensitivities. Keep proper nouns unchanged. Produce only the Polish translation, without any additional explanations or commentary. Please translate the following English text into Polish:\n\n\nVaduz Castle is the palace and official residence of the Prince of Liechtenstein. The castle gave its name to the town of Vaduz, the capital of Liechtenstein, which it overlooks from an adjacent hilltop."}],"stream":false,"keep_alive":0}' | python3 -c "import sys, json; print('TEST TRANSLATEGEMMA:', json.load(sys.stdin)['message']['content'])"
-          echo "Czas testowego tłumaczenia TranslateGemma: $(( $(date +%s) - start )) s"
       - name: GraphHopper z pamięci podręcznej
         uses: actions/cache@v4
         with:
@@ -110,6 +193,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           UPLOAD_TARGET: github
           WIKI_CONTACT: ${{ secrets.WIKI_CONTACT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_PARALLEL_WORKERS: ${{ needs.lista.outputs.mode == 'sharded' && '1' || needs.lista.outputs.gemini_workers }}
+          JOB_INDEX: ${{ strategy.job-index }}
           TILE_LANG: pl
           PIN_COUNTRIES: ${{ inputs.kraje }}
           ONLY_TILES: ${{ matrix.tiles }}
@@ -121,6 +207,8 @@ jobs:
           GH_TIMEOUT_S: "7200"
           OLLAMA_MODEL: "translategemma:4b"
           LLM_MAX_PER_TILE: ${{ (vars.TLUMACZENIA_AI || '1') == '0' && '0' || '999999' }}
+          TR_MAX_SENTENCES: "5"
+          TR_MAX_CHARS: "1050"
           TRANSLATE_MAX_S: "12600"
           WIKI_LONG_MAX_PER_TILE: "10000"
           WIKI_FOREIGN_LONG_MAX: "10000"
@@ -128,38 +216,86 @@ jobs:
           MAX_RUNTIME_S: "18900"
         run: |
           python -u BuildWorldGrid_v2.py
-          if [ -s grid_work_v2/failed_tiles_v2.txt ]; then echo "Nieukończone kafle (dokończy kolejna runda):"; cat grid_work_v2/failed_tiles_v2.txt; exit 1; fi
+          if [ -s grid_work_v2/paused_tiles_v2.txt ]; then
+            echo "⏸️ Postęp zapisany — kolejna runda dokończy automatycznie:"
+            cat grid_work_v2/paused_tiles_v2.txt
+          fi
+          if [ -s grid_work_v2/failed_tiles_v2.txt ]; then
+            echo "⚠️ Chwilowy błąd przy kaflach (kolejna runda ponowi):"
+            cat grid_work_v2/failed_tiles_v2.txt
+          fi
       - name: Zapis logu
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: log-${{ inputs.partia }}-${{ strategy.job-index }}
+          name: log-${{ inputs.partia }}-${{ inputs.runda }}-${{ strategy.job-index }}
           path: builder/grid_work_v2/builder_v2.log
           if-no-files-found: ignore
           retention-days: 7
 
   nastepna:
-    needs: [lista, kafle]
+    needs: [lista, tlumacz, kafle]
     if: always() && needs.lista.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - name: Uruchom następną partię
+      - name: Uruchom następną partię lub rundę
         env:
           GH_TOKEN: ${{ github.token }}
-          PARTIA: ${{ inputs.partia }}
+          DONE: ${{ needs.lista.outputs.done }}
+          NEXT_BATCH: ${{ needs.lista.outputs.next_batch }}
+          HAS_MORE_BATCHES: ${{ needs.lista.outputs.has_more_batches }}
           PARTIE: ${{ needs.lista.outputs.partie }}
           RUNDA: ${{ inputs.runda }}
           KRAJE: ${{ inputs.kraje }}
-          KAFLE_OK: ${{ needs.kafle.result }}
+          CHECK_TILES: ${{ needs.lista.outputs.check_tiles }}
         run: |
-          if [ "$PARTIA" -lt "$PARTIE" ]; then
-            gh workflow run 1-kraje.yml --repo "$GITHUB_REPOSITORY" -f kraje="$KRAJE" -f partia=$((PARTIA + 1)) -f runda="$RUNDA"
-            echo "Uruchomiono partię $((PARTIA + 1)) z $PARTIE"
-          elif [ "$PARTIE" -eq 1 ] && [ "$KAFLE_OK" = "success" ]; then
-            echo "KONIEC - wszystkie kafle zbudowane"
-          elif [ "$RUNDA" -lt 10 ]; then
-            gh workflow run 1-kraje.yml --repo "$GITHUB_REPOSITORY" -f kraje="$KRAJE" -f partia=1 -f runda=$((RUNDA + 1))
-            echo "Runda $((RUNDA + 1)): wznawianie tłumaczeń i uzupełnianie brakujących kafli (gotowe są pomijane)"
+          run_next() {
+            local p="$1" r="$2"
+            for i in 1 2 3 4 5; do
+              if gh workflow run 1-kraje.yml --repo "$GITHUB_REPOSITORY" -f kraje="$KRAJE" -f partia="$p" -f runda="$r"; then
+                return 0
+              fi
+              echo "Ponawiam uruchomienie kolejnej partii ($i/5)..."
+              sleep 15
+            done
+            return 1
+          }
+
+          if [ "$DONE" = "1" ]; then
+            echo "🎉 KONIEC - wszystkie kafle dla '$KRAJE' są już zbudowane!"
+            exit 0
+          fi
+
+          if [ "$HAS_MORE_BATCHES" = "1" ]; then
+            NEXT_P=$((NEXT_BATCH + 1))
+            run_next "$NEXT_P" "$RUNDA"
+            echo "Uruchomiono partię $NEXT_P z $PARTIE (runda $RUNDA)"
+            exit 0
+          fi
+
+          # Szybkie sprawdzenie dla małych partii (np. liechtenstein), czy wszystkie kafle już trafiły do Releases
+          if [ -n "$CHECK_TILES" ]; then
+            ALL_OK=1
+            IFS=',' read -ra TILES <<< "$CHECK_TILES"
+            for tid in "${TILES[@]}"; do
+              [ -z "$tid" ] && continue
+              tag=$(python3 -c 'import re,sys; m=re.match(r"^([NS])(\d{2})_([EW])(\d{3})$", sys.argv[1]); la=(int(m[2])*(1 if m[1]=="N" else -1)//10)*10; lo=(int(m[4])*(1 if m[3]=="E" else -1)//10)*10; ns=("N" if la>=0 else "S")+f"{abs(la):02d}"; ew=("E" if lo>=0 else "W")+f"{abs(lo):03d}"; print(f"kafle-{ns}_{ew}")' "$tid")
+              if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "tile_${tid}_pl_v2.tar.gz"; then
+                ALL_OK=0
+                echo "Kafel $tid jeszcze w trakcie — uruchamiam kolejną rundę."
+                break
+              fi
+            done
+            if [ "$ALL_OK" = "1" ]; then
+              echo "🎉 KONIEC - wszystkie kafle dla '$KRAJE' zostały zbudowane i wysłane!"
+              exit 0
+            fi
+          fi
+
+          if [ "$RUNDA" -lt 50 ]; then
+            NEXT_R=$((RUNDA + 1))
+            run_next 1 "$NEXT_R"
+            echo "Runda $NEXT_R: automatyczne wznawianie niedokończonych kafli (gotowe są pomijane)"
           else
-            echo "KONIEC - wszystkie partie i rundy zakończone"
+            echo "KONIEC - osiągnięto maksymalną liczbę 50 rund"
           fi
